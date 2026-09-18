@@ -36,10 +36,12 @@ const CFG = {
   cooldownMin: Math.max(15, Number(ENV.ALERT_COOLDOWN_MIN) || 120),
   watchlist: String(ENV.WATCHLIST || 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,SUIUSDT')
     .split(',').map(s => s.trim().toUpperCase()).filter(s => /^[A-Z0-9_]{5,20}$/.test(s)).slice(0, 40),
-  tgToken: String(ENV.TELEGRAM_TOKEN || '').trim(),
-  tgChat: String(ENV.TELEGRAM_CHAT || '').trim(),
-  waPhone: String(ENV.WA_PHONE || '').trim(),
-  waKey: String(ENV.WA_KEY || '').trim(),
+  // Blindagem de credenciais: remove espaços, aspas e caracteres inválidos
+  // que venham colados no valor da variável (causa clássica de "Not Found").
+  tgToken: String(ENV.TELEGRAM_TOKEN || '').replace(/[^A-Za-z0-9_:-]/g, '').trim(),
+  tgChat: String(ENV.TELEGRAM_CHAT || '').replace(/[^-0-9]/g, '').trim(),
+  waPhone: String(ENV.WA_PHONE || '').replace(/[^+0-9]/g, '').trim(),
+  waKey: String(ENV.WA_KEY || '').replace(/[^A-Za-z0-9]/g, '').trim(),
   gateOn: String(ENV.V11_GATE ?? '1') !== '0',
   port: Number(ENV.PORT) || 7860,
   stateFile: String(ENV.STATE_FILE || 'state.json')
@@ -513,6 +515,13 @@ function startServer(){
 if(isNode){
   loadState();
   log('🤖 VINGADOR BOT 24H iniciado · perfil ' + PROFILES[CFG.profile].nome + ' (' + PROFILES[CFG.profile].tfs.join('/') + ') · ' + CFG.watchlist.length + ' ativos · ciclo ' + CFG.intervalMin + 'min' + (CFG.gateOn ? ' · selo V11 ON' : ' · selo V11 OFF'));
+  // Diagnóstico de credenciais (mascarado — nunca imprime o token completo):
+  if(CFG.tgToken){
+    const okFormat = /^\d{5,12}:[A-Za-z0-9_-]{30,}$/.test(CFG.tgToken);
+    log('🔑 Telegram: token recebido (' + CFG.tgToken.length + ' chars, começa com "' + CFG.tgToken.slice(0, 8) + '...") · formato ' + (okFormat ? 'válido' : 'INVÁLIDO — deve ser 123456789:AA...') + ' · chat ' + (CFG.tgChat || 'VAZIO!'));
+  } else {
+    log('❌ Telegram: TELEGRAM_TOKEN vazio — confira a variável no Render → Environment');
+  }
   startServer();
   if(CFG.tgToken && CFG.tgChat){
     sendTelegram('🤖 VINGADOR BOT 24H online ✅\nPerfil: ' + PROFILES[CFG.profile].nome + ' (' + PROFILES[CFG.profile].tfs.join('/') + ')\nAtivos: ' + CFG.watchlist.join(', ') + '\nCiclo: a cada ' + CFG.intervalMin + 'min\n🛡 Selo V11: ' + (CFG.gateOn ? 'ativo' : 'desligado'));
