@@ -52,21 +52,49 @@ function log(msg){
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function aiRound(x){ if(x == null || !isFinite(x)) return null; const a = Math.abs(x); return a >= 1000 ? Number(x.toFixed(2)) : a >= 1 ? Number(x.toFixed(4)) : Number(x.toFixed(6)); }
 
+/* ---------------- anti-ban ----------------
+   IPs de servidores gratuitos sao compartilhados e a Binance limita
+   requisicoes em rajada (429 -> ban temporario 418). Estrategia:
+   - espaco maior entre simbolos (SCAN_GAP_MS)
+   - cache dos candles do BTC (era baixado de novo para CADA ativo)
+   - pausa global automatica ao receber 429/418 */
+let BAN_UNTIL = 0;
 async function fetchJson(url, timeout = 9000){
+  if(Date.now() < BAN_UNTIL) throw new Error('HTTP 429 (pausa anti-ban ativa, aguarde)');
   const c = new AbortController();
   const t = setTimeout(() => c.abort(), timeout);
   try{
     const r = await fetch(url, { cache: 'no-store', signal: c.signal });
-    if(!r.ok) throw new Error('HTTP ' + r.status);
+    if(!r.ok){
+      if(r.status === 429 || r.status === 418){
+        BAN_UNTIL = Date.now() + 120000;
+        log('⏸ Binance limitou o IP (' + r.status + ') — pausa automática de 2min');
+        throw new Error('HTTP ' + r.status + ' (limite de requisições — pausa de 2min)');
+      }
+      throw new Error('HTTP ' + r.status);
+    }
     return await r.json();
   } finally { clearTimeout(t); }
 }
 async function fetchJsonRetry(url, tries = 2){
   let err;
   for(let i = 0; i < tries; i++){
-    try { return await fetchJson(url); } catch(e){ err = e; if(i < tries - 1) await sleep(800); }
+    try { return await fetchJson(url); } catch(e){
+      err = e;
+      if(i < tries - 1) await sleep(/429|418/.test(e.message) ? 15000 : 800);
+    }
   }
   throw err;
+}
+/* Cache dos candles do BTC (1h/4h): validos por 5 min, compartilhados
+   por todos os ativos do ciclo. Reduz ~2 chamadas por ativo. */
+const BTC_KCACHE = {};
+async function btcKlines(tf, limit){
+  const c = BTC_KCACHE[tf];
+  if(c && Date.now() - c.ts < 300000) return c.k.slice(-limit);
+  const k = await fetchJsonRetry(`${FBASE}/klines?symbol=BTCUSDT&interval=${tf}&limit=120`);
+  BTC_KCACHE[tf] = { k, ts: Date.now() };
+  return k.slice(-limit);
 }
 
 /* ---------------- indicadores (idênticos ao painel) ---------------- */
@@ -76,6 +104,7 @@ function aiAtr(kl, p = 14){ if(kl.length <= p) return null; const tr = []; for(l
 function aiAdx(kl, p = 14){ if(kl.length < 2 * p + 2) return null; const tr = [], plus = [], minus = []; for(let i = 1; i < kl.length; i++){ const h = +kl[i][2], l = +kl[i][3], ph = +kl[i - 1][2], pl = +kl[i - 1][3], pc = +kl[i - 1][4]; tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc))); const up = h - ph, down = pl - l; plus.push(up > down && up > 0 ? up : 0); minus.push(down > up && down > 0 ? down : 0); } let atr = tr.slice(0, p).reduce((a, b) => a + b, 0) / p, ps = plus.slice(0, p).reduce((a, b) => a + b, 0) / p, ms = minus.slice(0, p).reduce((a, b) => a + b, 0) / p; const dx = []; for(let i = p; i < tr.length; i++){ atr = (atr * (p - 1) + tr[i]) / p; ps = (ps * (p - 1) + plus[i]) / p; ms = (ms * (p - 1) + minus[i]) / p; const pdi = 100 * ps / atr, mdi = 100 * ms / atr; dx.push(100 * Math.abs(pdi - mdi) / (pdi + mdi || 1)); } if(dx.length < p) return null; let adx = dx.slice(0, p).reduce((a, b) => a + b, 0) / p; for(let i = p; i < dx.length; i++) adx = (adx * (p - 1) + dx[i]) / p; return adx; }
 
 const v11Clamp = (x, a = 0, b = 100) => Math.max(a, Math.min(b, Number(x) || 0));
+const SCAN_GAP_MS = Math.max(2000, Number(ENV.SCAN_GAP_MS) || 4000);
 function v11EMA(a, p){ if(a.length < p) return null; let e = a.slice(0, p).reduce((x, y) => x + y, 0) / p, k = 2 / (p + 1); for(let i = p; i < a.length; i++) e = a[i] * k + e * (1 - k); return e; }
 function v11RSI(a, p = 14){ if(a.length <= p) return null; let g = 0, l = 0; for(let i = 1; i <= p; i++){ let d = a[i] - a[i - 1]; g += Math.max(d, 0); l += Math.max(-d, 0); } let ag = g / p, al = l / p; for(let i = p + 1; i < a.length; i++){ let d = a[i] - a[i - 1]; ag = (ag * (p - 1) + Math.max(d, 0)) / p; al = (al * (p - 1) + Math.max(-d, 0)) / p; } return al === 0 ? 100 : 100 - 100 / (1 + ag / al); }
 function v11ATR(k, p = 14){ if(k.length <= p) return null; let tr = []; for(let i = 1; i < k.length; i++){ let h = +k[i][2], l = +k[i][3], pc = +k[i - 1][4]; tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc))); } let a = tr.slice(0, p).reduce((x, y) => x + y, 0) / p; for(let i = p; i < tr.length; i++) a = (a * (p - 1) + tr[i]) / p; return a; }
@@ -106,8 +135,8 @@ async function buildContext(sym, tfs){
     fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
     fetchJsonRetry(`${FBASE}/ticker/24hr?symbol=${sym}`),
     fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1d&limit=8`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=BTCUSDT&interval=1h&limit=100`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=BTCUSDT&interval=4h&limit=100`),
+    btcKlines('1h', 100),
+    btcKlines('4h', 100),
     fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
     fetchJson(`${FBASE}/depth?symbol=${sym}&limit=50`).catch(() => null)
   ]);
@@ -236,8 +265,8 @@ async function v11Gate(sym){
     fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=15m&limit=220`),
     fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1h&limit=220`),
     fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=4h&limit=220`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=BTCUSDT&interval=1h&limit=120`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=BTCUSDT&interval=4h&limit=120`),
+    btcKlines('1h', 120),
+    btcKlines('4h', 120),
     fetchJson(`${FBASE}/depth?symbol=${sym}&limit=100`).catch(() => ({ bids: [], asks: [] })),
     fetchJson(`${FBASE}/aggTrades?symbol=${sym}&limit=1000`).catch(() => []),
     fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
@@ -445,7 +474,10 @@ async function runScanCycle(){
   log('🔎 Varredura iniciada · ' + CFG.watchlist.length + ' ativos · perfil ' + PROFILES[CFG.profile].nome);
   for(const sym of CFG.watchlist){
     try { await scanSymbol(sym); } catch(e){ log('ERRO ' + sym + ': ' + e.message); }
-    await sleep(1200);
+    // Respiro entre ativos: IPs compartilhados de servidor grátis são
+    // limitados pela Binance em rajada. 4s é o equilíbrio seguro.
+    // Ajustável pela variável SCAN_GAP_MS.
+    await sleep(SCAN_GAP_MS);
   }
   state.cycles++;
   state.lastScan = Date.now();
