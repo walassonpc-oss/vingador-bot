@@ -60,7 +60,7 @@ function aiRound(x){ if(x == null || !isFinite(x)) return null; const a = Math.a
    - espaco maior entre simbolos (SCAN_GAP_MS)
    - cache dos candles do BTC (era baixado de novo para CADA ativo)
    - pausa global automatica ao receber 429/418 */
-let BAN_UNTIL = 0;
+let BAN_UNTIL = 0, BAN_HITS = 0;
 async function fetchJson(url, timeout = 9000){
   if(Date.now() < BAN_UNTIL) throw new Error('HTTP 429 (pausa anti-ban ativa, aguarde)');
   const c = new AbortController();
@@ -69,12 +69,17 @@ async function fetchJson(url, timeout = 9000){
     const r = await fetch(url, { cache: 'no-store', signal: c.signal });
     if(!r.ok){
       if(r.status === 429 || r.status === 418){
-        BAN_UNTIL = Date.now() + 120000;
-        log('⏸ Binance limitou o IP (' + r.status + ') — pausa automática de 2min');
-        throw new Error('HTTP ' + r.status + ' (limite de requisições — pausa de 2min)');
+        // Pausa progressiva: 10, 20, 30... até 60min. Martelar a Binance
+        // durante o ban renova a suspensão — quanto mais 418, mais espera.
+        BAN_HITS++;
+        const pausaMin = Math.min(60, 10 * BAN_HITS);
+        BAN_UNTIL = Date.now() + pausaMin * 60000;
+        log('⏸ Binance limitou o IP (' + r.status + ') — pausa de ' + pausaMin + 'min (offset anti-ban ' + BAN_HITS + ')');
+        throw new Error('HTTP ' + r.status + ' (pausa de ' + pausaMin + 'min)');
       }
       throw new Error('HTTP ' + r.status);
     }
+    BAN_HITS = 0;
     return await r.json();
   } finally { clearTimeout(t); }
 }
@@ -127,20 +132,29 @@ function v11Calc(k){
   return { close: c.at(-1), prev: c.at(-2), e9, e21, e50, e200, r, atr, atrPct: atr / c.at(-1) * 100, adx, vol: v.at(-1), volRatio: v.at(-1) / (avg || 1), takerRatio: tR, takerImbalance, cvdBias: takerImbalance, trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed', high20: Math.max(...k.slice(-20).map(x => +x[2])), low20: Math.min(...k.slice(-20).map(x => +x[3])) };
 }
 
+/* Requisições SEQUENCIAIS com respiro: rajada simultânea (Promise.all com 11
+   chamadas) é o gatilho do ban 418 da Binance em IPs compartilhados. */
+const REQ_GAP_MS = Math.max(150, Number(ENV.REQ_GAP_MS) || 400);
+async function seq(jobs){
+  const out = [];
+  for(const j of jobs){ out.push(await j()); await sleep(REQ_GAP_MS); }
+  return out;
+}
+
 /* ---------------- contexto de mercado (igual aiFetchContext do painel) ---------------- */
 async function buildContext(sym, tfs){
   const LIMITS = { '5m': 220, '15m': 220, '30m': 220, '1h': 220, '4h': 220, '1d': 220 };
   const raw = async (tf) => { const k = await fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=${tf}&limit=${LIMITS[tf] || 220}`); return k.filter(x => Number(x[6]) <= Date.now()); };
-  const [kA, kB, kC, fund, oi, t24, k7d, b1h, b4h, oiHist, depth] = await Promise.all([
-    raw(tfs[0]), raw(tfs[1]), raw(tfs[2]),
-    fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
-    fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
-    fetchJsonRetry(`${FBASE}/ticker/24hr?symbol=${sym}`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1d&limit=8`),
-    btcKlines('1h', 100),
-    btcKlines('4h', 100),
-    fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
-    fetchJson(`${FBASE}/depth?symbol=${sym}&limit=50`).catch(() => null)
+  const [kA, kB, kC, fund, oi, t24, k7d, b1h, b4h, oiHist, depth] = await seq([
+    () => raw(tfs[0]), () => raw(tfs[1]), () => raw(tfs[2]),
+    () => fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
+    () => fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
+    () => fetchJsonRetry(`${FBASE}/ticker/24hr?symbol=${sym}`),
+    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1d&limit=8`),
+    () => btcKlines('1h', 100),
+    () => btcKlines('4h', 100),
+    () => fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
+    () => fetchJson(`${FBASE}/depth?symbol=${sym}&limit=50`).catch(() => null)
   ]);
   const calc = (k) => {
     k = (Array.isArray(k) ? k : []).filter(x => Number(x[6]) <= Date.now());
@@ -263,18 +277,18 @@ function localDecision(ctx){
 
 /* ---------------- selo V11 (igual v11Compute do painel) ---------------- */
 async function v11Gate(sym){
-  const [k15, k1, k4, b1, b4, depth, trades, fund, oi, oiHist, t24] = await Promise.all([
-    fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=15m&limit=220`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1h&limit=220`),
-    fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=4h&limit=220`),
-    btcKlines('1h', 120),
-    btcKlines('4h', 120),
-    fetchJson(`${FBASE}/depth?symbol=${sym}&limit=100`).catch(() => ({ bids: [], asks: [] })),
-    fetchJson(`${FBASE}/aggTrades?symbol=${sym}&limit=1000`).catch(() => []),
-    fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
-    fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
-    fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
-    fetchJson(`${FBASE}/ticker/24hr?symbol=${sym}`).catch(() => ({ quoteVolume: 0 }))
+  const [k15, k1, k4, b1, b4, depth, trades, fund, oi, oiHist, t24] = await seq([
+    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=15m&limit=220`),
+    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1h&limit=220`),
+    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=4h&limit=220`),
+    () => btcKlines('1h', 120),
+    () => btcKlines('4h', 120),
+    () => fetchJson(`${FBASE}/depth?symbol=${sym}&limit=100`).catch(() => ({ bids: [], asks: [] })),
+    () => fetchJson(`${FBASE}/aggTrades?symbol=${sym}&limit=1000`).catch(() => []),
+    () => fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
+    () => fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
+    () => fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
+    () => fetchJson(`${FBASE}/ticker/24hr?symbol=${sym}`).catch(() => ({ quoteVolume: 0 }))
   ]);
   if(!Array.isArray(k15) || !k15.length || !Array.isArray(k1) || !k1.length || !Array.isArray(k4) || !k4.length || !Array.isArray(b1) || !b1.length || !Array.isArray(b4) || !b4.length) throw new Error('Histórico insuficiente para V11');
   const c15 = v11Calc(k15), c1 = v11Calc(k1), c4 = v11Calc(k4), btc1 = v11Calc(b1), btc4 = v11Calc(b4);
