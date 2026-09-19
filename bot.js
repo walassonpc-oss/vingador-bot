@@ -20,9 +20,77 @@
 const isNode = (typeof process !== 'undefined') && (typeof window === 'undefined');
 const ENV = isNode ? process.env : (globalThis.__VG_ENV__ || {});
 
-const FBASE = 'https://fapi.binance.com/fapi/v1';
-const FDATA = 'https://fapi.binance.com/futures/data';
+const BYBIT = 'https://api.bybit.com';
 const AI_MIN_RR = 1.8;
+
+/* ---------------- fonte de dados: Bybit V5 (pública, sem chave) ----------------
+   Por que Bybit: a Binance bane IPs de datacenter (418) e IPs compartilhados de
+   hospedagem grátis ficam permanentemente queimados. A Bybit aceita varredura
+   leve de servidores. Os klines são convertidos para o formato Binance para
+   TODO o motor matemático continuar idêntico ao painel. */
+const TF_MS = { '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000 };
+const BYBIT_IV = { '5m': '5', '15m': '15', '30m': '30', '1h': '60', '4h': '240', '1d': 'D' };
+async function bbJson(url, timeout = 9000){
+  const r = await fetchJson(url, timeout);
+  if(r && r.retCode !== undefined && r.retCode !== 0) throw new Error('Bybit ' + r.retCode + ' ' + (r.retMsg || ''));
+  return r;
+}
+async function byKlines(sym, tf, limit){
+  const r = await bbJson(`${BYBIT}/v5/market/kline?category=linear&symbol=${sym}&interval=${BYBIT_IV[tf] || '15'}&limit=${Math.min(1000, limit)}`);
+  const list = (r.result && r.result.list) || [];
+  const ms = TF_MS[tf] || 900000;
+  // Envelope novo→antigo da Bybit → formato Binance antigo→novo:
+  // [0]openTime [1]open [2]high [3]low [4]close [5]volume [6]closeTime [9]takerBuy
+  return list.map(x => [+x[0], x[1], x[2], x[3], x[4], x[5], +x[0] + ms - 1, '0', '0', 0]).reverse();
+}
+async function byBook(sym, limit){
+  const r = await bbJson(`${BYBIT}/v5/market/orderbook?category=linear&symbol=${sym}&limit=${limit}`);
+  return { bids: (r.result && r.result.b) || [], asks: (r.result && r.result.a) || [] };
+}
+async function byTrades(sym){
+  const r = await bbJson(`${BYBIT}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=1000`);
+  return ((r.result && r.result.list) || []).map(t => ({ p: t.price, q: t.size, T: Number(t.time), m: t.side === 'Sell' }));
+}
+async function byTickers(sym){
+  const r = await bbJson(`${BYBIT}/v5/market/tickers?category=linear&symbol=${sym}`);
+  const tk = (r.result && r.result.list && r.result.list[0]) || {};
+  return {
+    fund: { lastFundingRate: tk.fundingRate },
+    oi: { openInterest: tk.openInterest },
+    t24: { lastPrice: tk.lastPrice, priceChangePercent: (+tk.price24hPcnt || 0) * 100, quoteVolume: tk.turnover24h }
+  };
+}
+/* Histórico de Open Interest próprio: a Bybit retirou o endpoint de histórico,
+   então amostramos o OI atual (do tickers, que funciona) a cada ciclo e guardamos
+   no state.json. Após ~6h rodando, oiChange(6h) fica disponível com dado real. */
+function oiSample(sym, val){
+  if(!val || !isFinite(val)) return;
+  const h = state.oiHist = state.oiHist || {};
+  const arr = (h[sym] = h[sym] || []).filter(x => Date.now() - x.ts < 26 * 3600000);
+  arr.push({ ts: Date.now(), v: val });
+  if(arr.length > 170) arr.shift();
+  h[sym] = arr;
+}
+function oiChange(sym, val, horas){
+  const arr = (state.oiHist && state.oiHist[sym]) || [];
+  if(arr.length < 2 || !val) return null;
+  const alvo = Date.now() - horas * 3600000;
+  let best = null, bd = Infinity;
+  for(const x of arr){ const d = Math.abs(x.ts - alvo); if(d < bd){ bd = d; best = x; } }
+  if(!best || bd > 45 * 60000) return null;
+  return aiRound((val / best.v - 1) * 100);
+}
+/* Fluxo de agressor (taker): a Bybit não fornece volume comprador por candle
+   como a Binance; usamos as últimas 1000 negociações reais (lado agressor).
+   FLOW é aplicado só aos cálculos do ativo em análise — BTC fica neutro. */
+let FLOW = null;
+function flowFromTrades(tr){
+  const list = Array.isArray(tr) ? tr : [];
+  let buy = 0, sell = 0;
+  for(const t of list){ const q = Number(t.q) || 0; if(t.m === false) buy += q; else sell += q; }
+  const tot = buy + sell;
+  return tot ? { ratio: buy / tot, imb: (buy - sell) / tot } : { ratio: 0.5, imb: 0 };
+}
 
 const PROFILES = {
   padrao: { nome: 'Padrão', tfs: ['15m', '1h', '4h'], hold: 4 * 3600000 },
@@ -99,7 +167,7 @@ const BTC_KCACHE = {};
 async function btcKlines(tf, limit){
   const c = BTC_KCACHE[tf];
   if(c && Date.now() - c.ts < 300000) return c.k.slice(-limit);
-  const k = await fetchJsonRetry(`${FBASE}/klines?symbol=BTCUSDT&interval=${tf}&limit=120`);
+  const k = await byKlines('BTCUSDT', tf, 120);
   BTC_KCACHE[tf] = { k, ts: Date.now() };
   return k.slice(-limit);
 }
@@ -125,10 +193,14 @@ function v11Calc(k){
   const e9 = v11EMA(c, 9), e21 = v11EMA(c, 21), e50 = v11EMA(c, 50), e200 = c.length >= 200 ? v11EMA(c, 200) : null;
   const r = v11RSI(c), atr = v11ATR(k), adx = v11Adx(k);
   const avg = v.slice(-21, -1).reduce((a, b) => a + b, 0) / Math.max(1, v.slice(-21, -1).length);
-  const tb = k.map(x => +x[9] || 0), n20 = Math.min(20, v.length);
-  const buy20 = tb.slice(-n20).reduce((a, b) => a + b, 0), vol20 = v.slice(-n20).reduce((a, b) => a + b, 0);
-  const tR = buy20 / (vol20 || 1);
-  const takerImbalance = vol20 ? (2 * buy20 - vol20) / vol20 : 0;
+  let tR, takerImbalance;
+  if(FLOW){ tR = FLOW.ratio; takerImbalance = FLOW.imb; }
+  else {
+    const tb = k.map(x => +x[9] || 0), n20 = Math.min(20, v.length);
+    const buy20 = tb.slice(-n20).reduce((a, b) => a + b, 0), vol20 = v.slice(-n20).reduce((a, b) => a + b, 0);
+    tR = buy20 / (vol20 || 1);
+    takerImbalance = vol20 ? (2 * buy20 - vol20) / vol20 : 0;
+  }
   return { close: c.at(-1), prev: c.at(-2), e9, e21, e50, e200, r, atr, atrPct: atr / c.at(-1) * 100, adx, vol: v.at(-1), volRatio: v.at(-1) / (avg || 1), takerRatio: tR, takerImbalance, cvdBias: takerImbalance, trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed', high20: Math.max(...k.slice(-20).map(x => +x[2])), low20: Math.min(...k.slice(-20).map(x => +x[3])) };
 }
 
@@ -144,17 +216,15 @@ async function seq(jobs){
 /* ---------------- contexto de mercado (igual aiFetchContext do painel) ---------------- */
 async function buildContext(sym, tfs){
   const LIMITS = { '5m': 220, '15m': 220, '30m': 220, '1h': 220, '4h': 220, '1d': 220 };
-  const raw = async (tf) => { const k = await fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=${tf}&limit=${LIMITS[tf] || 220}`); return k.filter(x => Number(x[6]) <= Date.now()); };
-  const [kA, kB, kC, fund, oi, t24, k7d, b1h, b4h, oiHist, depth] = await seq([
+  const raw = async (tf) => byKlines(sym, tf, LIMITS[tf] || 220);
+  const [kA, kB, kC, tkr, k7d, b1h, b4h, depth, trades] = await seq([
     () => raw(tfs[0]), () => raw(tfs[1]), () => raw(tfs[2]),
-    () => fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
-    () => fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
-    () => fetchJsonRetry(`${FBASE}/ticker/24hr?symbol=${sym}`),
-    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1d&limit=8`),
+    () => byTickers(sym),
+    () => byKlines(sym, '1d', 8),
     () => btcKlines('1h', 100),
     () => btcKlines('4h', 100),
-    () => fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
-    () => fetchJson(`${FBASE}/depth?symbol=${sym}&limit=50`).catch(() => null)
+    () => byBook(sym, 50).catch(() => null),
+    () => byTrades(sym).catch(() => [])
   ]);
   const calc = (k) => {
     k = (Array.isArray(k) ? k : []).filter(x => Number(x[6]) <= Date.now());
@@ -163,29 +233,33 @@ async function buildContext(sym, tfs){
     const last = c[c.length - 1], prev = c[c.length - 2];
     const vol = v[v.length - 1], vavg = v.slice(-21, -1).reduce((x, y) => x + y, 0) / Math.max(1, v.slice(-21, -1).length);
     const highs = k.slice(-30).map(x => +x[2]), lows = k.slice(-30).map(x => +x[3]);
-    const tb = k.map(x => +x[9] || 0), n20 = Math.min(20, v.length);
-    const vol20 = v.slice(-n20).reduce((x, y) => x + y, 0) || 1;
-    const buy20 = tb.slice(-n20).reduce((x, y) => x + y, 0);
-    const takerRatio = buy20 / vol20;
-    const takerImbalance = (2 * buy20 - vol20) / vol20;
+    let takerRatio, takerImbalance;
+    if(FLOW){ takerRatio = FLOW.ratio; takerImbalance = FLOW.imb; }
+    else {
+      const tb = k.map(x => +x[9] || 0), n20 = Math.min(20, v.length);
+      const vol20 = v.slice(-n20).reduce((x, y) => x + y, 0) || 1;
+      const buy20 = tb.slice(-n20).reduce((x, y) => x + y, 0);
+      takerRatio = buy20 / vol20;
+      takerImbalance = (2 * buy20 - vol20) / vol20;
+    }
     return { close: aiRound(last), prevClose: aiRound(prev), rsi: aiRound(r), ema9: aiRound(e9), ema21: aiRound(e21), ema50: aiRound(e50), ema200: e200 == null ? null : aiRound(e200), atr: aiRound(a), atrPct: aiRound(a / last * 100), adx: aiRound(adx), volume: aiRound(vol), volumeRatio: aiRound(vol / (vavg || 1)), high30: aiRound(Math.max(...highs)), low30: aiRound(Math.min(...lows)), takerRatio: aiRound(takerRatio), takerImbalance: aiRound(takerImbalance), cvdBias: aiRound(takerImbalance), trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed' };
   };
+  FLOW = flowFromTrades(trades);
   const cA = calc(kA), cB = calc(kB), cC = calc(kC);
+  FLOW = null;
   const k7Closed = (Array.isArray(k7d) ? k7d : []).filter(x => Number(x[6]) <= Date.now());
   const c7First = +(k7Closed[0]?.[1] || 0), c7Last = +(k7Closed.at(-1)?.[4] || 0);
-  const fr = +fund.lastFundingRate || 0, oiVal = +oi.openInterest || 0;
-  const price = +t24.lastPrice || cA.close;
+  const fr = +(tkr.fund.lastFundingRate) || 0, oiVal = +(tkr.oi.openInterest) || 0;
+  const price = +(tkr.t24.lastPrice) || cA.close;
   const btc1 = calc(b1h), btc4 = calc(b4h);
-  const oh = Array.isArray(oiHist) ? oiHist : [];
-  const oiNow = oh.length ? +oh[oh.length - 1].sumOpenInterestValue : null;
-  const oiChg6h = (oiNow && oh.length >= 7) ? aiRound((oiNow / +oh[oh.length - 7].sumOpenInterestValue - 1) * 100) : null;
-  const oiChg24h = (oiNow && oh.length >= 25) ? aiRound((oiNow / +oh[oh.length - 25].sumOpenInterestValue - 1) * 100) : null;
+  oiSample(sym, oiVal);
+  const oiChg6h = oiChange(sym, oiVal, 6), oiChg24h = oiChange(sym, oiVal, 24);
   const bb = Number(depth?.bids?.[0]?.[0]), ba = Number(depth?.asks?.[0]?.[0]);
   const spreadBps = (bb && ba) ? aiRound((ba - bb) / ((ba + bb) / 2) * 10000) : null;
   const hUTC = new Date().getUTCHours();
   const sessao = hUTC < 7 ? 'ÁSIA (liquidez baixa)' : hUTC < 12 ? 'EUROPA' : hUTC < 21 ? 'EUA (maior liquidez)' : 'PÓS-EUA';
   const corrBtc = v11Corr(kB.map(x => +x[4]), b1h.map(x => +x[4]));
-  return { ativo: sym, price: aiRound(price), var24h: aiRound(+t24.priceChangePercent), var7d: c7First ? aiRound((c7Last - c7First) / c7First * 100) : null, funding: aiRound(fr * 100), openInterest: aiRound(oiVal), oiChange6h: oiChg6h, oiChange24h: oiChg24h, spreadBps, sessao, btcCorrelation: (corrBtc === null ? null : aiRound(corrBtc)), time: new Date().toISOString(), perfil: tfs.join('/'), timeframes: { [tfs[0]]: cA, [tfs[1]]: cB, [tfs[2]]: cC }, btc: { '1h': { trend: btc1.trend, rsi: btc1.rsi, adx: btc1.adx }, '4h': { trend: btc4.trend, rsi: btc4.rsi, adx: btc4.adx } } };
+  return { ativo: sym, price: aiRound(price), var24h: aiRound(+(tkr.t24.priceChangePercent)), var7d: c7First ? aiRound((c7Last - c7First) / c7First * 100) : null, funding: aiRound(fr * 100), openInterest: aiRound(oiVal), oiChange6h: oiChg6h, oiChange24h: oiChg24h, spreadBps, sessao, btcCorrelation: (corrBtc === null ? null : aiRound(corrBtc)), time: new Date().toISOString(), perfil: tfs.join('/'), timeframes: { [tfs[0]]: cA, [tfs[1]]: cB, [tfs[2]]: cC }, btc: { '1h': { trend: btc1.trend, rsi: btc1.rsi, adx: btc1.adx }, '4h': { trend: btc4.trend, rsi: btc4.rsi, adx: btc4.adx } } };
 }
 
 /* ---------------- decisão local (checklist a-h + regras duras) ---------------- */
@@ -277,21 +351,22 @@ function localDecision(ctx){
 
 /* ---------------- selo V11 (igual v11Compute do painel) ---------------- */
 async function v11Gate(sym){
-  const [k15, k1, k4, b1, b4, depth, trades, fund, oi, oiHist, t24] = await seq([
-    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=15m&limit=220`),
-    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=1h&limit=220`),
-    () => fetchJsonRetry(`${FBASE}/klines?symbol=${sym}&interval=4h&limit=220`),
+  const [k15, k1, k4, b1, b4, depth, trades, tkr] = await seq([
+    () => byKlines(sym, '15m', 220),
+    () => byKlines(sym, '1h', 220),
+    () => byKlines(sym, '4h', 220),
     () => btcKlines('1h', 120),
     () => btcKlines('4h', 120),
-    () => fetchJson(`${FBASE}/depth?symbol=${sym}&limit=100`).catch(() => ({ bids: [], asks: [] })),
-    () => fetchJson(`${FBASE}/aggTrades?symbol=${sym}&limit=1000`).catch(() => []),
-    () => fetchJsonRetry(`${FBASE}/premiumIndex?symbol=${sym}`),
-    () => fetchJsonRetry(`${FBASE}/openInterest?symbol=${sym}`),
-    () => fetchJson(`${FDATA}/openInterestHist?symbol=${sym}&period=1h&limit=25`).catch(() => []),
-    () => fetchJson(`${FBASE}/ticker/24hr?symbol=${sym}`).catch(() => ({ quoteVolume: 0 }))
+    () => byBook(sym, 200).catch(() => ({ bids: [], asks: [] })),
+    () => byTrades(sym).catch(() => []),
+    () => byTickers(sym)
   ]);
+  const fund = tkr.fund, oi = tkr.oi, t24 = { quoteVolume: tkr.t24.quoteVolume };
   if(!Array.isArray(k15) || !k15.length || !Array.isArray(k1) || !k1.length || !Array.isArray(k4) || !k4.length || !Array.isArray(b1) || !b1.length || !Array.isArray(b4) || !b4.length) throw new Error('Histórico insuficiente para V11');
-  const c15 = v11Calc(k15), c1 = v11Calc(k1), c4 = v11Calc(k4), btc1 = v11Calc(b1), btc4 = v11Calc(b4);
+  FLOW = flowFromTrades(trades);
+  const c15 = v11Calc(k15), c1 = v11Calc(k1), c4 = v11Calc(k4);
+  FLOW = null;
+  const btc1 = v11Calc(b1), btc4 = v11Calc(b4);
   const regime = v11Regime(c1, c4);
   const mtf = (c15.trend === c1.trend && c1.trend === c4.trend && c1.trend !== 'mixed') ? 20 : (c1.trend === c4.trend && c1.trend !== 'mixed' ? 12 : 0);
   const trend = v11Clamp(30 + v11TrendScore(c15) + v11TrendScore(c1) + v11TrendScore(c4), 0, 30);
@@ -314,7 +389,7 @@ async function v11Gate(sym){
   const bidNot = near(bids), askNot = near(asks);
   const imb = (bidNot + askNot) ? (bidNot - askNot) / (bidNot + askNot) : 0;
   let whaleBuy = 0, whaleSell = 0, whaleN = 0;
-  const whaleNow = trades.length ? Number(trades[trades.length - 1].T) : Date.now();
+  const whaleNow = Date.now();
   const q24 = Math.max(0, Number(t24.quoteVolume) || 0);
   const whaleThreshold = Math.max(50000, q24 * 0.0002);
   for(const t of trades){
@@ -326,9 +401,9 @@ async function v11Gate(sym){
   const corrBtc = v11Corr(k1.map(x => +x[4]), b1.map(x => +x[4]));
   const bb = Number(depth.bids?.[0]?.[0]), ba = Number(depth.asks?.[0]?.[0]);
   const spreadBps = (bb && ba) ? ((ba - bb) / ((ba + bb) / 2) * 10000) : null;
-  const oiHistArr = Array.isArray(oiHist) ? oiHist : [];
-  const oiNow = oiHistArr.length ? +oiHistArr[oiHistArr.length - 1].sumOpenInterestValue : null;
-  const oiChg6h = (oiNow && oiHistArr.length >= 7) ? (oiNow / +oiHistArr[oiHistArr.length - 7].sumOpenInterestValue - 1) * 100 : null;
+  const oiValBy = +oi.openInterest || 0;
+  oiSample(sym, oiValBy);
+  const oiChg6h = oiChange(sym, oiValBy, 6);
   const px6h = k1.length >= 7 ? (+k1[k1.length - 1][4] / +k1[k1.length - 7][4] - 1) * 100 : 0;
   const cvdScore = v11Clamp((c15.takerImbalance * 10 + c1.takerImbalance * 8 + c4.takerImbalance * 4) / 1.2, -12, 12);
   const flow = v11Clamp(cvdScore + v11Clamp(imb * 8, -6, 6) + v11Clamp(whaleBias * 5, -5, 5), -22, 22);
@@ -418,9 +493,9 @@ async function scoreTick(){
   if(!open.length) return;
   const syms = [...new Set(open.map(s => s.sym))];
   try{
-    const r = await fetchJson(`${FBASE}/ticker/price?symbols=${encodeURIComponent(JSON.stringify(syms))}`);
+    const r = await bbJson(`${BYBIT}/v5/market/tickers?category=linear`);
     const px = {};
-    (Array.isArray(r) ? r : []).forEach(x => { px[x.symbol] = parseFloat(x.price); });
+    ((r.result && r.result.list) || []).forEach(x => { px[x.symbol] = parseFloat(x.lastPrice); });
     let changed = false;
     for(const s of open){
       const p = px[s.sym]; if(!p) continue;
@@ -441,7 +516,7 @@ if(isNode){ try { fsMod = require('fs'); } catch(e){} }
 function saveState(){
   if(!fsMod) return;
   try{
-    fsMod.writeFileSync(CFG.stateFile, JSON.stringify({ signals: state.signals, alertTs: state.alertTs, cycles: state.cycles, alertsSent: state.alertsSent, lastScan: state.lastScan, startedAt: state.startedAt }));
+    fsMod.writeFileSync(CFG.stateFile, JSON.stringify({ signals: state.signals, alertTs: state.alertTs, cycles: state.cycles, alertsSent: state.alertsSent, lastScan: state.lastScan, startedAt: state.startedAt, oiHist: state.oiHist || {} }));
   } catch(e){}
 }
 function loadState(){
@@ -455,6 +530,7 @@ function loadState(){
       state.alertsSent = d.alertsSent || 0;
       state.lastScan = d.lastScan || 0;
       state.startedAt = d.startedAt || Date.now();
+      state.oiHist = (d.oiHist && typeof d.oiHist === 'object') ? d.oiHist : {};
     }
   } catch(e){}
 }
