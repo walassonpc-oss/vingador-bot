@@ -118,6 +118,8 @@ const CFG = {
   roboRisk: Math.min(0.02, Number(ENV.ROBO_RISK) || 0.01),              // 1% por trade (teto 2%)
   roboMaxPos: Math.max(1, Math.min(3, Number(ENV.ROBO_MAXPOS) || 2)),   // máx 2 posições (teto 3)
   roboDailyStop: Math.min(0.1, Number(ENV.ROBO_DAILY_STOP) || 0.03),    // kill switch: -3% no dia
+  roboLev: Math.max(1, Math.min(20, Number(ENV.ROBO_LEV) || 5)),        // alavancagem 5x (teto 20x)
+  roboMetaPct: Math.min(10, Number(ENV.ROBO_META_PCT) || 1.5),          // meta diária: 1.5% da equity (escala com a conta)
   port: Number(ENV.PORT) || 7860,
   stateFile: String(ENV.STATE_FILE || 'state.json')
 };
@@ -570,14 +572,42 @@ function loadState(){
    - comandos no Telegram: PAUSAR · RETOMAR · FECHAR TUDO · STATUS */
 function roboDay(){ return new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }); }
 function roboEnsure(){
-  if(!state.robo) state.robo = { eq: CFG.roboEq, day: roboDay(), dayStartEq: CFG.roboEq, dayPnl: 0, paused: false, killed: false, positions: [], closed: [], tgOffset: 0, trades: 0 };
+  if(!state.robo) state.robo = { eq: CFG.roboEq, day: roboDay(), dayStartEq: CFG.roboEq, dayPnl: 0, paused: false, killed: false, positions: [], closed: [], tgOffset: 0, trades: 0, dayWins: 0, dayLosses: 0 };
+  if(state.robo.dayWins == null) state.robo.dayWins = 0;
+  if(state.robo.dayLosses == null) state.robo.dayLosses = 0;
   if(state.robo.day !== roboDay()){
+    // Relatório noturno do dia anterior: dispara na virada da meia-noite (SP), 1x por dia
+    const f = { dia: state.robo.day, pnl: state.robo.dayPnl || 0, w: state.robo.dayWins || 0, l: state.robo.dayLosses || 0, eq: state.robo.eq, startEq: state.robo.dayStartEq };
     state.robo.day = roboDay();
     state.robo.dayStartEq = state.robo.eq;
     state.robo.dayPnl = 0;
+    state.robo.dayWins = 0;
+    state.robo.dayLosses = 0;
     state.robo.killed = false;
     log('🗓 Robô: novo dia operacional · equity ' + fmtV(state.robo.eq));
+    roboRelatorio(f);
   }
+}
+function roboMeta(){ return (state.robo ? state.robo.dayStartEq : CFG.roboEq) * CFG.roboMetaPct / 100; }
+function roboSemana(){
+  const R = state.robo; if(!R) return 0;
+  const corte = Date.now() - 7 * 86400000;
+  return ((R.closed || []).filter(c => c.ts >= corte).reduce((a, c) => a + (c.pnl || 0), 0));
+}
+function roboRelatorio(f){
+  if(!CFG.tgToken || !CFG.tgChat) return;
+  const meta = (f.startEq || CFG.roboEq) * CFG.roboMetaPct / 100;
+  const bateu = f.pnl >= meta;
+  const sem = roboSemana();
+  const total = (state.robo.closed || []);
+  const wins = total.filter(c => c.why === 'WIN').length, losses = total.filter(c => c.why === 'LOSS').length;
+  sendAlert('🌙 RELATÓRIO ROBÔ PAPER · ' + f.dia + '\n'
+    + 'Resultado: ' + (f.pnl >= 0 ? '+' : '') + fmtV(f.pnl) + ' / meta ' + fmtV(meta) + (bateu ? ' ✅ BATIDA' : ' · abaixo da meta') + '\n'
+    + 'Trades do dia: ' + f.w + ' ✅ · ' + f.l + ' ❌\n'
+    + '💰 Equity: ' + fmtV(f.eq) + '\n'
+    + '📅 Últimos 7 dias: ' + (sem >= 0 ? '+' : '') + fmtV(sem) + ' (meta semanal +7 a +10)\n'
+    + '📊 Histórico total: ' + wins + ' wins · ' + losses + ' losses\n'
+    + (bateu ? 'Meta é média, não promessa — amanhã recomeça de zero. 🤝' : 'Manter a disciplina: meta é média semanal, não promessa diária.'));
 }
 function roboOpen(sym, res){
   roboEnsure();
@@ -592,15 +622,19 @@ function roboOpen(sym, res){
   if(riskDist <= 0 || riskDist / entry > 0.05) return; // stop absurdo (>5%)? não opera
   const riskUSD = R.eq * CFG.roboRisk;
   const qty = riskUSD / riskDist;
-  const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
-  R.positions.push(pos);
+  // Alavancagem (padrão 5x): não muda o PnL (quem define é a qty), mas define a
+  // margem usada e a liquidação. Com stop <= 5%, o stop sempre chega antes da liq.
   const notional = qty * entry;
-  log('🤖 ROBÔ PAPER #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ')');
-  sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + '\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
+  const margin = notional / CFG.roboLev;
+  const liq = side === 'LONG' ? entry * (1 - 1 / CFG.roboLev * 0.9) : entry * (1 + 1 / CFG.roboLev * 0.9);
+  const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), lev: CFG.roboLev, margin: Number(margin.toFixed(2)), liq: aiRound(liq), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
+  R.positions.push(pos);
+  log('🤖 ROBÔ PAPER #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
+  sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🏦 Margem ' + fmtV(margin) + ' · Liquidação ≈ ' + fmtV(liq) + '\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
 }
 async function roboTick(){
-  if(!state.robo || !state.robo.positions || !state.robo.positions.length) return;
   roboEnsure();
+  if(!state.robo || !state.robo.positions || !state.robo.positions.length) return;
   const R = state.robo;
   let px = null;
   try{
@@ -632,6 +666,8 @@ function roboClose(p, price, why){
   const pnlR = pnl / (p.riskUSD || 1);
   R.eq = Number((R.eq + pnl).toFixed(4));
   R.dayPnl = Number(((R.dayPnl || 0) + pnl).toFixed(4));
+  if(why === 'WIN') R.dayWins = (R.dayWins || 0) + 1;
+  if(why === 'LOSS') R.dayLosses = (R.dayLosses || 0) + 1;
   R.positions = R.positions.filter(x => x.id !== p.id);
   R.closed.push({ id: p.id, sym: p.sym, side: p.side, entry: p.entry, exit: aiRound(price), why, pnl: Number(pnl.toFixed(4)), pnlR: Number(pnlR.toFixed(2)), ts: Date.now() });
   if(R.closed.length > 200) R.closed = R.closed.slice(-200);
@@ -664,7 +700,9 @@ async function roboCmd(){
       saveState();
     } else if(t.includes('STATUS')){
       const R2 = state.robo, dia = R2.dayPnl || 0;
-      sendAlert('🤖 ROBÔ PAPER · STATUS\nEquity: ' + fmtV(R2.eq) + '\nDia: ' + (dia >= 0 ? '+' : '') + fmtV(dia) + '\nPosições abertas: ' + R2.positions.length + '/' + CFG.roboMaxPos + (R2.paused ? '\n⏸ pausado' : '') + (R2.killed ? '\n🛑 kill switch ativo' : ''));
+      const meta = roboMeta();
+      const metaTxt = dia >= meta ? '✅ META BATIDA' : 'faltam ' + fmtV(Math.max(0, meta - dia)) + ' p/ meta';
+      sendAlert('🤖 ROBÔ PAPER · STATUS\nEquity: ' + fmtV(R2.eq) + '\nDia: ' + (dia >= 0 ? '+' : '') + fmtV(dia) + ' / meta +' + fmtV(meta) + ' · ' + metaTxt + '\nSemana (7d): ' + (roboSemana() >= 0 ? '+' : '') + fmtV(roboSemana()) + '\nPosições abertas: ' + R2.positions.length + '/' + CFG.roboMaxPos + (R2.paused ? '\n⏸ pausado' : '') + (R2.killed ? '\n🛑 kill switch ativo' : ''));
     }
   }
   if(ups.length) saveState();
@@ -770,8 +808,8 @@ if(isNode){
   setInterval(() => scoreTick().catch(() => {}), 30000);
   if(CFG.robo){
     roboEnsure();
-    log('🧪 ROBÔ PAPER ativo · equity virtual ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '%/trade · máx ' + CFG.roboMaxPos + ' posições · kill diário -' + (CFG.roboDailyStop * 100) + '%');
-    if(CFG.tgToken && CFG.tgChat) sendTelegram('🧪 ROBÔ PAPER ativo ✅\nEquity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nMáx ' + CFG.roboMaxPos + ' posições · kill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
+    log('🧪 ROBÔ PAPER ativo · equity virtual ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '%/trade · máx ' + CFG.roboMaxPos + ' posições · kill diário -' + (CFG.roboDailyStop * 100) + '% · futuros ' + CFG.roboLev + 'x');
+    if(CFG.tgToken && CFG.tgChat) sendTelegram('🧪 ROBÔ PAPER ativo ✅\nEquity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nFuturos Bybit · alavancagem ' + CFG.roboLev + 'x · máx ' + CFG.roboMaxPos + ' posições\nKill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
     setInterval(() => roboTick().catch(e => log('roboTick: ' + e.message)), 30000);
     setInterval(() => roboCmd().catch(() => {}), 20000);
   }
