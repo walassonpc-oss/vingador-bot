@@ -233,6 +233,8 @@ async function buildContext(sym, tfs){
     const last = c[c.length - 1], prev = c[c.length - 2];
     const vol = v[v.length - 1], vavg = v.slice(-21, -1).reduce((x, y) => x + y, 0) / Math.max(1, v.slice(-21, -1).length);
     const highs = k.slice(-30).map(x => +x[2]), lows = k.slice(-30).map(x => +x[3]);
+    const lastK = k[k.length - 1];
+    const lastRange = lastK ? (+lastK[2] - +lastK[3]) : null;
     let takerRatio, takerImbalance;
     if(FLOW){ takerRatio = FLOW.ratio; takerImbalance = FLOW.imb; }
     else {
@@ -242,7 +244,7 @@ async function buildContext(sym, tfs){
       takerRatio = buy20 / vol20;
       takerImbalance = (2 * buy20 - vol20) / vol20;
     }
-    return { close: aiRound(last), prevClose: aiRound(prev), rsi: aiRound(r), ema9: aiRound(e9), ema21: aiRound(e21), ema50: aiRound(e50), ema200: e200 == null ? null : aiRound(e200), atr: aiRound(a), atrPct: aiRound(a / last * 100), adx: aiRound(adx), volume: aiRound(vol), volumeRatio: aiRound(vol / (vavg || 1)), high30: aiRound(Math.max(...highs)), low30: aiRound(Math.min(...lows)), takerRatio: aiRound(takerRatio), takerImbalance: aiRound(takerImbalance), cvdBias: aiRound(takerImbalance), trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed' };
+    return { close: aiRound(last), prevClose: aiRound(prev), rsi: aiRound(r), ema9: aiRound(e9), ema21: aiRound(e21), ema50: aiRound(e50), ema200: e200 == null ? null : aiRound(e200), atr: aiRound(a), atrPct: aiRound(a / last * 100), adx: aiRound(adx), volume: aiRound(vol), volumeRatio: aiRound(vol / (vavg || 1)), high30: aiRound(Math.max(...highs)), low30: aiRound(Math.min(...lows)), lastRange: lastRange == null ? null : aiRound(lastRange), takerRatio: aiRound(takerRatio), takerImbalance: aiRound(takerImbalance), cvdBias: aiRound(takerImbalance), trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed' };
   };
   FLOW = flowFromTrades(trades);
   const cA = calc(kA), cB = calc(kB), cC = calc(kC);
@@ -328,13 +330,22 @@ function localDecision(ctx){
   else if(Math.abs(A.close - A.ema21) <= 0.6 * atr) setup = 'pullback';
   const timeStopHoras = T[0] === '5m' ? 2 : T[0] === '1d' ? 48 : 8;
   const spreadOk = ctx.spreadBps == null || ctx.spreadBps <= 15;
-  const valida = !tie && nTrue >= 5 && fk.d_fluxo && spreadOk;
+  /* Filtro anti-spike: candle anterior com amplitude > 2.5x ATR = mercado em
+     pânico/spike (o caso do JUP que estopou em 27s). Não entra nessa vela. */
+  const spike = A.lastRange != null && atr > 0 && A.lastRange > 2.5 * atr;
+  /* R:R estrutural mínimo: só valida se houver espaço até a estrutura (topos/fundos
+     de 30 candles) para pelo menos MIN_RR_ESTRUTURAL x o risco da operação. */
+  const roomRR = long ? (A.high30 - entry) / risk : (entry - A.low30) / risk;
+  const rrOk = roomRR >= 1.3;
+  const valida = !tie && nTrue >= 5 && fk.d_fluxo && spreadOk && !spike && rrOk;
   let conf = 30 + nTrue * 9;
   if(asiaScalp) conf -= 10;
   const just = Object.keys(fk).filter(k => fk[k]).map(k => V11_FACTOR_LABELS[k]);
   const riscos = Object.keys(fk).filter(k => !fk[k]).map(k => 'Falhou: ' + V11_FACTOR_LABELS[k]);
   if(/ÁSIA/.test(ctx.sessao || '')) riscos.push('Sessão de baixa liquidez: ' + ctx.sessao);
   if(ctx.btcCorrelation != null && ctx.btcCorrelation > 0.8) riscos.push('Correlação alta com BTC (' + ctx.btcCorrelation + ')');
+  if(spike) riscos.push('Spike detectado: último candle com amplitude > 2.5× ATR');
+  if(!rrOk && !tie) riscos.push('Espaço estrutural insuficiente: R:R de cena ' + (isFinite(roomRR) ? roomRR.toFixed(2) : '?') + ' < 1.3');
   const raw = {
     direcao: valida ? side : 'NEUTRO',
     status: valida ? 'ENTRADA_VALIDADA' : 'AGUARDAR',
@@ -501,7 +512,12 @@ async function scoreTick(){
       const p = px[s.sym]; if(!p) continue;
       const hitTP = s.side === 'LONG' ? p >= s.tp1 : p <= s.tp1;
       const hitSL = s.side === 'LONG' ? p <= s.sl : p >= s.sl;
-      if(hitSL){ s.state = 'loss'; s.exit = p; s.closedTs = Date.now(); changed = true; await notifyScore(s, 'LOSS'); }
+      if(hitSL){
+        s.state = 'loss'; s.exit = p; s.closedTs = Date.now(); changed = true;
+        // Cooldown pós-loss: registra a data pro scan não re-entrar na mesma direção
+        (state.lossTs = state.lossTs || {})[s.sym + ':' + s.side] = Date.now();
+        await notifyScore(s, 'LOSS');
+      }
       else if(hitTP){ s.state = 'win'; s.exit = p; s.closedTs = Date.now(); changed = true; await notifyScore(s, 'WIN'); }
       else if(Date.now() - s.ts > s.maxHold){ s.state = 'timeout'; s.exit = p; s.closedTs = Date.now(); changed = true; await notifyScore(s, 'TIMEOUT'); }
     }
@@ -516,7 +532,7 @@ if(isNode){ try { fsMod = require('fs'); } catch(e){} }
 function saveState(){
   if(!fsMod) return;
   try{
-    fsMod.writeFileSync(CFG.stateFile, JSON.stringify({ signals: state.signals, alertTs: state.alertTs, cycles: state.cycles, alertsSent: state.alertsSent, lastScan: state.lastScan, startedAt: state.startedAt, oiHist: state.oiHist || {} }));
+    fsMod.writeFileSync(CFG.stateFile, JSON.stringify({ signals: state.signals, alertTs: state.alertTs, cycles: state.cycles, alertsSent: state.alertsSent, lastScan: state.lastScan, startedAt: state.startedAt, oiHist: state.oiHist || {}, lossTs: state.lossTs || {} }));
   } catch(e){}
 }
 function loadState(){
@@ -531,6 +547,7 @@ function loadState(){
       state.lastScan = d.lastScan || 0;
       state.startedAt = d.startedAt || Date.now();
       state.oiHist = (d.oiHist && typeof d.oiHist === 'object') ? d.oiHist : {};
+      state.lossTs = (d.lossTs && typeof d.lossTs === 'object') ? d.lossTs : {};
     }
   } catch(e){}
 }
@@ -545,6 +562,13 @@ async function scanSymbol(sym){
   const key = sym + ':' + res.direcao;
   const last = state.alertTs[key] || 0;
   if(Date.now() - last < CFG.cooldownMin * 60000){ log('⏳ ' + sym + ' ' + res.direcao + ': sinal válido em cooldown (' + CFG.cooldownMin + 'min)'); return; }
+  /* Cooldown pós-loss (6h): estopou nessa direção? Só reentra com confiança >= 80.
+     Mata a re-entrada suicida (ex.: SUI LONG estopado 4x no mesmo dia). */
+  const lastLoss = (state.lossTs || {})[key] || 0;
+  if(Date.now() - lastLoss < 6 * 3600000 && res.confianca < 80){
+    log('🧊 ' + sym + ' ' + res.direcao + ': em cooldown pós-loss (6h) — confiança ' + res.confianca + ' < 80. Aguardando sinal forte.');
+    return;
+  }
   let v11 = null;
   if(CFG.gateOn){
     try { v11 = await v11Gate(sym); } catch(e){ log('V11 falhou em ' + sym + ': ' + e.message); }
