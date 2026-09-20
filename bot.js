@@ -28,8 +28,8 @@ const AI_MIN_RR = 1.8;
    hospedagem grátis ficam permanentemente queimados. A Bybit aceita varredura
    leve de servidores. Os klines são convertidos para o formato Binance para
    TODO o motor matemático continuar idêntico ao painel. */
-const TF_MS = { '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000 };
-const BYBIT_IV = { '5m': '5', '15m': '15', '30m': '30', '1h': '60', '4h': '240', '1d': 'D' };
+const TF_MS = { '1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000 };
+const BYBIT_IV = { '1m': '1', '5m': '5', '15m': '15', '30m': '30', '1h': '60', '4h': '240', '1d': 'D' };
 async function bbJson(url, timeout = 9000){
   const r = await fetchJson(url, timeout);
   if(r && r.retCode !== undefined && r.retCode !== 0) throw new Error('Bybit ' + r.retCode + ' ' + (r.retMsg || ''));
@@ -645,10 +645,31 @@ async function roboTick(){
   const fechar = [];
   for(const p of R.positions){
     const price = px[p.sym]; if(!price) continue;
-    const hitTP = p.side === 'LONG' ? price >= p.tp : price <= p.tp;
-    const hitSL = p.side === 'LONG' ? price <= p.sl : price >= p.sl;
+    let hitTP = p.side === 'LONG' ? price >= p.tp : price <= p.tp;
+    let hitSL = p.side === 'LONG' ? price <= p.sl : price >= p.sl;
+    /* Varredura de pavio (candles 1m): o poll de 30s pode perder um pavio rápido
+       que atravessou o stop e voltou (caso SUI #1). O high/low do candle registra
+       TODO preço que negociou — se tocou, dispara. Tocou SL e TP no mesmo candle
+       = LOSS (conservador, mesma regra do painel). A saída usa o preço do nível,
+       como uma ordem real de stop/TP dispararia na corretora. */
+    let exit = price;
+    if(hitSL){ exit = p.sl; }
+    else if(hitTP){ exit = p.tp; }
+    else {
+      try{
+        const kl = await byKlines(p.sym, '1m', 30);
+        const desde = kl.filter(c => Number(c[0]) >= p.ts - 60000);
+        for(const c of desde){
+          const hi = +c[2], lo = +c[3];
+          const tSL = p.side === 'LONG' ? lo <= p.sl : hi >= p.sl;
+          const tTP = p.side === 'LONG' ? hi >= p.tp : lo <= p.tp;
+          if(tSL){ hitSL = true; exit = p.sl; break; }
+          if(tTP){ hitTP = true; exit = p.tp; break; }
+        }
+      } catch(e){}
+    }
     const expired = Date.now() - p.ts > p.maxHold;
-    if(hitTP || hitSL || expired) fechar.push({ p, price, why: hitTP ? 'WIN' : hitSL ? 'LOSS' : 'TIMEOUT' });
+    if(hitTP || hitSL || expired) fechar.push({ p, price: exit, why: hitTP ? 'WIN' : hitSL ? 'LOSS' : 'TIMEOUT' });
   }
   for(const f of fechar) roboClose(f.p, f.price, f.why);
   if(fechar.length){
