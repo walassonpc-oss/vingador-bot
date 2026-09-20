@@ -114,7 +114,7 @@ const CFG = {
   // Robô paper trading: executa os sinais em posição SIMULADA no preço real.
   // Limites fixos de segurança (nem você nem eu estouramos por engano):
   robo: String(ENV.ROBO ?? '1') !== '0',
-  roboEq: Number(ENV.ROBO_EQ) || 1000,                                  // equity virtual inicial
+  roboEq: Number(ENV.ROBO_EQ) || 100,                                   // equity virtual inicial ($100 = capital real)
   roboRisk: Math.min(0.02, Number(ENV.ROBO_RISK) || 0.01),              // 1% por trade (teto 2%)
   roboMaxPos: Math.max(1, Math.min(3, Number(ENV.ROBO_MAXPOS) || 2)),   // máx 2 posições (teto 3)
   roboDailyStop: Math.min(0.1, Number(ENV.ROBO_DAILY_STOP) || 0.03),    // kill switch: -3% no dia
