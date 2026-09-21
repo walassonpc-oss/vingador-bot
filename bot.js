@@ -627,7 +627,7 @@ function roboOpen(sym, res){
   const notional = qty * entry;
   const margin = notional / CFG.roboLev;
   const liq = side === 'LONG' ? entry * (1 - 1 / CFG.roboLev * 0.9) : entry * (1 + 1 / CFG.roboLev * 0.9);
-  const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), lev: CFG.roboLev, margin: Number(margin.toFixed(2)), liq: aiRound(liq), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
+  const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), risk0: aiRound(riskDist), trailLvl: 0, qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), lev: CFG.roboLev, margin: Number(margin.toFixed(2)), liq: aiRound(liq), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
   R.positions.push(pos);
   log('🤖 ROBÔ PAPER #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
   sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🏦 Margem ' + fmtV(margin) + ' · Liquidação ≈ ' + fmtV(liq) + '\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
@@ -669,6 +669,26 @@ async function roboTick(){
       } catch(e){}
     }
     const expired = Date.now() - p.ts > p.maxHold;
+    /* Trailing de alvo: quando o preço se aproxima do TP1, o stop SOBE para
+       travar lucro em vez de deixar o alvo devolver. Nível 1 (80% do caminho):
+       stop para metade do caminho (trava ~1R com alvo 2R). Nível 2 (90%):
+       stop para 80% do caminho (trava quase todo o lucro). Frações do caminho,
+       então funciona com qualquer TP. Máx 2 alertas por posição (sem spam). */
+    if(!hitSL && !hitTP && !expired){
+      const dirT = p.side === 'LONG' ? 1 : -1;
+      const caminho = Math.abs(p.tp - p.entry);
+      const prog = (price - p.entry) * dirT;
+      if(caminho > 0 && (p.trailLvl || 0) < 1 && prog >= 0.8 * caminho){
+        p.sl = aiRound(p.entry + dirT * 0.5 * caminho);
+        p.trailLvl = 1; saveState();
+        sendAlert('🔒 ROBÔ PAPER #' + p.id + ' ' + p.sym + ': 80% do caminho — stop travando metade do lucro (SL ' + fmtV(p.sl) + ')');
+      }
+      if(caminho > 0 && (p.trailLvl || 0) < 2 && prog >= 0.9 * caminho){
+        p.sl = aiRound(p.entry + dirT * 0.8 * caminho);
+        p.trailLvl = 2; saveState();
+        sendAlert('🔒 ROBÔ PAPER #' + p.id + ' ' + p.sym + ': 90% do caminho — stop travando 80% do lucro (SL ' + fmtV(p.sl) + ')');
+      }
+    }
     if(hitTP || hitSL || expired) fechar.push({ p, price: exit, why: hitTP ? 'WIN' : hitSL ? 'LOSS' : 'TIMEOUT' });
   }
   for(const f of fechar) roboClose(f.p, f.price, f.why);
