@@ -606,13 +606,23 @@ function loadState(){
    (a Bolsa dispara mesmo se o robô dormir) — é a grande vantagem sobre o paper.
    Zero risco: a chave só existe na conta demo, nunca na real. */
 const BB_DEMO = 'https://api-demo.bybit.com';
-const DEMO_RECV = '5000';
+const DEMO_RECV = '6000';
+/* Sincronização de clock (validado ao vivo): a demo rejeita req_timestamp
+   deslocado (10002). O Render tem NTP, mas sincronizar com o /time da Bybit
+   no boot deixa o bot imune a drift em qualquer host. */
+let DEMO_OFF = 0;
+async function demoSync(){
+  try{
+    const r = await bbJson(BB_DEMO + '/v5/market/time');
+    if(r && r.time) DEMO_OFF = r.time - Date.now();
+  } catch(e){}
+}
 function demoSign(ts, payload){
   return cryptoMod.createHmac('sha256', CFG.bybitSecret).update(ts + CFG.bybitKey + DEMO_RECV + payload).digest('hex');
 }
 async function demoApi(method, path, params){
   if(!cryptoMod || !CFG.bybitKey || !CFG.bybitSecret) throw new Error('Bybit demo não configurado (BYBIT_API_KEY/SECRET)');
-  const ts = Date.now().toString();
+  const ts = (Date.now() + DEMO_OFF).toString();
   let url = BB_DEMO + path, payload = '';
   const opt = { method, cache: 'no-store', headers: { 'X-BAPI-API-KEY': CFG.bybitKey, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': DEMO_RECV, 'Content-Type': 'application/json' } };
   if(method === 'GET'){
@@ -645,6 +655,7 @@ function demoQtyRound(q, lot){
   return r < lot.min ? lot.min : Number(r.toFixed(8));
 }
 const DEMO_TRACK = new Map();
+const DEMO_PART = new Map();
 async function demoTick(){
   if(!CFG.bybitDemo) return;
   try{
@@ -654,14 +665,34 @@ async function demoTick(){
     for(const p of open){
       if(!DEMO_TRACK.has(p.symbol)){
         DEMO_TRACK.set(p.symbol, p.side);
+        DEMO_PART.delete(p.symbol);
         const upnl = parseFloat(p.unrealisedPnl) || 0;
         log('🟨 DEMO posição: ' + p.symbol + ' ' + p.side + ' ' + p.size + ' @ ' + p.avgPrice + ' · uPnL ' + upnl.toFixed(4));
         sendAlert('🟨 DEMO: posição aberta na corretora ✅\n' + p.symbol + ' ' + p.side + ' ' + p.size + ' @ ' + fmtV(p.avgPrice) + '\n🛑 SL e 🏁 TP registrados na BOLSA (disparam mesmo se o robô dormir)\nAlavancagem: ' + p.leverage + 'x · uPnL: ' + (upnl >= 0 ? '+' : '') + upnl.toFixed(4) + ' USDT');
+      }
+      /* TP1 PARCIAL live (mecânica MT5): uPnL atingiu +1R (risco = |SL-entrada|)?
+         Fecha 50% com ordem reduceOnly e move o stop do exchange pro breakeven. */
+      else if(!DEMO_PART.has(p.symbol)){
+        const dir = p.side === 'Buy' ? 1 : -1;
+        const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice) || entry, sl = parseFloat(p.stopLoss) || 0;
+        const risk = sl ? Math.abs(entry - sl) : 0;
+        const prog = (mark - entry) * dir;
+        if(risk > 0 && prog >= risk){
+          const half = String((parseFloat(p.size) * 0.5).toFixed(3));
+          try{
+            await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.symbol, side: p.side === 'Buy' ? 'Sell' : 'Buy', orderType: 'Market', qty: half, reduceOnly: true, positionIdx: 0 });
+            await demoApi('POST', '/v5/position/set-trading-stop', { category: 'linear', symbol: p.symbol, stopLoss: String(aiRound(entry + dir * 0.05 * risk)), positionIdx: 0 }).catch(() => {});
+            DEMO_PART.set(p.symbol, true);
+            log('🟨 DEMO TP1 parcial: ' + p.symbol + ' 50% fechado em +1R, stop no breakeven');
+            sendAlert('🎯 DEMO ' + p.symbol + ': TP1 PARCIAL — 50% fechado em +1R\n🛑 Stop no breakeven (a BOLSA dispara sozinha). Resto corre até TP1/TP2.');
+          } catch(e){ log('❌ DEMO parcial falhou em ' + p.symbol + ': ' + e.message); }
+        }
       }
     }
     for(const [sym2, side2] of [...DEMO_TRACK]){
       if(!open.some(p => p.symbol === sym2)){
         DEMO_TRACK.delete(sym2);
+        DEMO_PART.delete(sym2);
         let rp = null;
         try{
           const c = await demoApi('GET', '/v5/position/closed-pnl', { category: 'linear', symbol: sym2, limit: 1 });
@@ -809,6 +840,25 @@ async function roboTick(){
       } catch(e){}
     }
     const expired = Date.now() - p.ts > p.maxHold;
+    /* TP1 PARCIAL (mecânica clássica dos EAs de MetaTrader 5): quando o trade
+       atinge +1R, fecha 50% da posição (trava meio lucro) e sobe o stop pro
+       breakeven+buffer. Reduz variância e mata o "volo a volo" que devolve
+       lucro. O resto corre até TP1/TP2 com o trailing. */
+    if(!hitSL && !hitTP && !expired && !p.partClosed){
+      const dirT = p.side === 'LONG' ? 1 : -1;
+      const prog = (price - p.entry) * dirT;
+      if(p.risk0 > 0 && p.qty > 0 && prog >= p.risk0){
+        const met = Math.max(1e-6, Number((p.qty * 0.5).toFixed(6)));
+        const pnlH = Number((met * p.risk0).toFixed(4));
+        R.eq = Number((R.eq + pnlH).toFixed(4));
+        R.dayPnl = Number(((R.dayPnl || 0) + pnlH).toFixed(4));
+        p.partClosed = true;
+        p.qty = Number((p.qty - met).toFixed(6));
+        p.sl = aiRound(p.entry + dirT * 0.05 * p.risk0);
+        saveState();
+        sendAlert('🎯 ROBÔ PAPER #' + p.id + ' ' + p.sym + ': TP1 PARCIAL — 50% fechado em +1R (+' + fmtV(pnlH) + ')\n🛑 Stop sobe pro breakeven (' + fmtV(p.sl) + '). Resto corre até TP1/TP2.');
+      }
+    }
     /* Trailing de alvo: quando o preço se aproxima do TP1, o stop SOBE para
        travar lucro em vez de deixar o alvo devolver. Nível 1 (80% do caminho):
        stop para metade do caminho (trava ~1R com alvo 2R). Nível 2 (90%):
@@ -1261,12 +1311,16 @@ if(isNode){
     if(!cryptoMod) log('❌ Bybit demo: módulo crypto indisponível');
     else if(CFG.bybitKey && CFG.bybitSecret){
       log('🟨 Bybit DEMO: validando chaves em api-demo.bybit.com...');
-      demoApi('GET', '/v5/account/wallet', { accountType: 'UNIFIED' }).then(r => {
-        const acc = (r && r.list && r.list[0]) || {};
-        const eq = parseFloat(acc.totalEquity) || 0;
-        log('🟨 Bybit DEMO conectada ✅ · equity demo ' + eq + ' USDT');
-        if(CFG.tgToken && CFG.tgChat) sendTelegram('🟨 CONTA DEMO conectada ✅\nEquity demo: ' + eq + ' USDT\nModo: ordens REAIS em conta demo (dinheiro virtual)\nDomínio: api-demo.bybit.com\nSL/TP registrados na Bolsa — disparam sozinhos');
-      }).catch(e => log('❌ Bybit demo FALHOU: ' + e.message + ' — confira BYBIT_API_KEY/SECRET e permissões (Read+Trade, sem restrição de IP)'));
+      (async () => {
+        await demoSync();
+        log('🟨 Bybit DEMO: clock sincronizado com a Bybit (offset ' + DEMO_OFF + 'ms)');
+        try{
+          const r = await demoApi('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDT' });
+          const n = ((r && r.list) || []).length;
+          log('🟨 Bybit DEMO conectada ✅ · chaves válidas · ' + n + ' posição(ões) aberta(s) no demo');
+          if(CFG.tgToken && CFG.tgChat) sendTelegram('🟨 CONTA DEMO conectada ✅\nChaves válidas (Read validado na Bybit)\nPosições demo abertas: ' + n + '\nModo: ordens REAIS em conta demo (dinheiro virtual)\nDomínio: api-demo.bybit.com\nSL/TP registrados na Bolsa — disparam sozinhos');
+        } catch(e){ log('❌ Bybit demo FALHOU: ' + e.message + ' — confira BYBIT_API_KEY/SECRET e permissões (Read+Trade, sem restrição de IP)'); }
+      })();
     } else log('⚠ BYBIT_DEMO=1 mas chaves vazias — modo demo inativo (configure BYBIT_API_KEY/SECRET no Render)');
   }
   if(!process.argv.includes('--selftest')) startServer();
