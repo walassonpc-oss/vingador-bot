@@ -112,6 +112,11 @@ const CFG = {
   waPhone: String(ENV.WA_PHONE || '').replace(/[^+0-9]/g, '').trim(),
   waKey: String(ENV.WA_KEY || '').replace(/[^A-Za-z0-9]/g, '').trim(),
   gateOn: String(ENV.V11_GATE ?? '1') !== '0',
+  // Bybit DEMO: ordens REAIS em conta demo (dinheiro virtual, dados reais).
+  // As chaves ficam no Render -> Environment, nunca no código.
+  bybitDemo: String(ENV.BYBIT_DEMO ?? '0') === '1',
+  bybitKey: String(ENV.BYBIT_API_KEY || '').replace(/[^A-Za-z0-9]/g, '').trim(),
+  bybitSecret: String(ENV.BYBIT_API_SECRET || '').replace(/[^A-Za-z0-9]/g, '').trim(),
   // Robô paper trading: executa os sinais em posição SIMULADA no preço real.
   // Limites fixos de segurança (nem você nem eu estouramos por engano):
   robo: String(ENV.ROBO ?? '1') !== '0',
@@ -569,8 +574,8 @@ async function scoreTick(){
 
 /* ---------------- estado ---------------- */
 let state = { signals: [], alertTs: {}, verdicts: {}, cycles: 0, alertsSent: 0, lastScan: 0, startedAt: Date.now(), robo: null };
-let fsMod = null;
-if(isNode){ try { fsMod = require('fs'); } catch(e){} }
+let fsMod = null, cryptoMod = null;
+if(isNode){ try { fsMod = require('fs'); } catch(e){} try { cryptoMod = require('crypto'); } catch(e){} }
 function saveState(){
   if(!fsMod) return;
   try{
@@ -593,6 +598,81 @@ function loadState(){
       state.robo = (d.robo && typeof d.robo === 'object') ? d.robo : null;
     }
   } catch(e){}
+}
+
+/* ================= BYBIT DEMO (ordens reais, dinheiro virtual) =================
+   Domínio api-demo.bybit.com (mesmos caminhos V5 da real). Autenticação HMAC:
+   assina ts + apiKey + recvWindow + corpo. SL/TP ficam REGISTRADOS na corretora
+   (a Bolsa dispara mesmo se o robô dormir) — é a grande vantagem sobre o paper.
+   Zero risco: a chave só existe na conta demo, nunca na real. */
+const BB_DEMO = 'https://api-demo.bybit.com';
+const DEMO_RECV = '5000';
+function demoSign(ts, payload){
+  return cryptoMod.createHmac('sha256', CFG.bybitSecret).update(ts + CFG.bybitKey + DEMO_RECV + payload).digest('hex');
+}
+async function demoApi(method, path, params){
+  if(!cryptoMod || !CFG.bybitKey || !CFG.bybitSecret) throw new Error('Bybit demo não configurado (BYBIT_API_KEY/SECRET)');
+  const ts = Date.now().toString();
+  let url = BB_DEMO + path, payload = '';
+  const opt = { method, cache: 'no-store', headers: { 'X-BAPI-API-KEY': CFG.bybitKey, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': DEMO_RECV, 'Content-Type': 'application/json' } };
+  if(method === 'GET'){
+    payload = new URLSearchParams(params || {}).toString();
+    if(payload) url += '?' + payload;
+  } else {
+    payload = JSON.stringify(params || {});
+    opt.body = payload;
+  }
+  opt.headers['X-BAPI-SIGN'] = demoSign(ts, payload);
+  const r = await fetch(url, opt);
+  const j = await r.json();
+  if(j && j.retCode !== 0) throw new Error('Bybit demo ' + j.retCode + ': ' + (j.retMsg || ''));
+  return j.result;
+}
+/* Filtro de lote por ativo (qtyStep/minOrderQty da Binance dos futuros): cacheia
+   instruments-info para arredondar a qty corretamente (qty fracionada = rejeição). */
+const DEMO_LOT = {};
+async function demoQtyStep(sym){
+  if(DEMO_LOT[sym]) return DEMO_LOT[sym];
+  try{
+    const r = await bbJson(`${BYBIT}/v5/market/instruments-info?category=linear&symbol=${sym}`);
+    const f = (r.result && r.result.list && r.result.list[0] && r.result.list[0].lotSizeFilter) || {};
+    DEMO_LOT[sym] = { step: parseFloat(f.qtyStep) || 0.001, min: parseFloat(f.minOrderQty) || 0.001 };
+  } catch(e){ DEMO_LOT[sym] = { step: 0.001, min: 0.001 }; }
+  return DEMO_LOT[sym];
+}
+function demoQtyRound(q, lot){
+  const r = Math.floor(q / lot.step) * lot.step;
+  return r < lot.min ? lot.min : Number(r.toFixed(8));
+}
+const DEMO_TRACK = new Map();
+async function demoTick(){
+  if(!CFG.bybitDemo) return;
+  try{
+    const r = await demoApi('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDT' });
+    const list = (r && r.list) || [];
+    const open = list.filter(p => parseFloat(p.size) > 0);
+    for(const p of open){
+      if(!DEMO_TRACK.has(p.symbol)){
+        DEMO_TRACK.set(p.symbol, p.side);
+        const upnl = parseFloat(p.unrealisedPnl) || 0;
+        log('🟨 DEMO posição: ' + p.symbol + ' ' + p.side + ' ' + p.size + ' @ ' + p.avgPrice + ' · uPnL ' + upnl.toFixed(4));
+        sendAlert('🟨 DEMO: posição aberta na corretora ✅\n' + p.symbol + ' ' + p.side + ' ' + p.size + ' @ ' + fmtV(p.avgPrice) + '\n🛑 SL e 🏁 TP registrados na BOLSA (disparam mesmo se o robô dormir)\nAlavancagem: ' + p.leverage + 'x · uPnL: ' + (upnl >= 0 ? '+' : '') + upnl.toFixed(4) + ' USDT');
+      }
+    }
+    for(const [sym2, side2] of [...DEMO_TRACK]){
+      if(!open.some(p => p.symbol === sym2)){
+        DEMO_TRACK.delete(sym2);
+        let rp = null;
+        try{
+          const c = await demoApi('GET', '/v5/position/closed-pnl', { category: 'linear', symbol: sym2, limit: 1 });
+          const item = (c && c.list && c.list[0]) || null;
+          if(item) rp = parseFloat(item.closedPnl) || 0;
+        } catch(e){}
+        log('🟨 DEMO posição fechada: ' + sym2 + (rp != null ? ' · PnL ' + rp.toFixed(4) : ''));
+        sendAlert('🟨 DEMO: posição FECHADA na corretora\n' + sym2 + ' ' + side2 + (rp != null ? '\n📊 PnL realizado: ' + (rp >= 0 ? '+' : '') + rp.toFixed(4) + ' USDT' : '') + '\n🏆 Placar do bot');
+      }
+    }
+  } catch(e){ log('demoTick: ' + e.message); }
 }
 
 /* ================= ROBÔ PAPER TRADING =================
@@ -642,7 +722,7 @@ function roboRelatorio(f){
     + '📊 Histórico total: ' + wins + ' wins · ' + losses + ' losses\n'
     + (bateu ? 'Meta é média, não promessa — amanhã recomeça de zero. 🤝' : 'Manter a disciplina: meta é média semanal, não promessa diária.'));
 }
-function roboOpen(sym, res){
+async function roboOpen(sym, res){
   roboEnsure();
   const R = state.robo;
   if(R.paused && R.pausedUntil && Date.now() > R.pausedUntil){ R.paused = false; delete R.pausedUntil; log('🤖 Robô: pausa do StoplossGuard expirou — retomando'); }
@@ -673,6 +753,24 @@ function roboOpen(sym, res){
   R.positions.push(pos);
   log('🤖 ROBÔ PAPER #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
   sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🏦 Margem ' + fmtV(margin) + ' · Liq estimada ≈ ' + fmtV(liq) + '\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
+  /* CONTA DEMO: se BYBIT_DEMO=1 e as chaves estão configuradas, manda a ordem
+     REAL (market) na conta demo com SL/TP e alavancagem registrados na Bolsa. */
+  if(CFG.bybitDemo){
+    try{
+      const lot = await demoQtyStep(sym);
+      const qtyD = demoQtyRound(qty, lot);
+      const levS = String(CFG.roboLev);
+      await demoApi('POST', '/v5/position/set-leverage', { category: 'linear', symbol: sym, buyLeverage: levS, sellLeverage: levS }).catch(e => { if(!/110043/.test(e.message)) log('⚠ alavancagem demo: ' + e.message); });
+      const r = await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: sym, side: side === 'LONG' ? 'Buy' : 'Sell', orderType: 'Market', qty: String(qtyD), stopLoss: String(sl), takeProfit: String(tp), positionIdx: 0 });
+      pos.demoOrderId = r.orderId;
+      log('🟨 DEMO: ordem enviada ' + sym + ' ' + side + ' qty ' + qtyD + ' (id ' + r.orderId + ')');
+      sendAlert('🟨 CONTA DEMO: ordem enviada ✅\n' + sym + ' ' + side + ' · Market · qty ' + qtyD + '\n🛑 SL ' + fmtV(sl) + ' · 🏁 TP1 ' + fmtV(tp) + ' registrados na BOLSA\nId: ' + r.orderId + '\n(positivo: a Bolsa dispara sozinha, mesmo se o Render dormir)');
+      saveState();
+    } catch(e){
+      log('❌ DEMO falhou em ' + sym + ': ' + e.message);
+      sendAlert('❌ CONTA DEMO: ordem FALHOU em ' + sym + '\nMotivo: ' + e.message + '\nA posição segue SÓ no papel. Confira chaves/permissões (Read+Trade) e fundos demo.');
+    }
+  }
 }
 async function roboTick(){
   roboEnsure();
@@ -794,7 +892,7 @@ function roboSummary(){
   const R = state.robo;
   if(!R) return { ativo: false };
   const closed = R.closed || [];
-  return { ativo: CFG.robo, modo: 'PAPER', eq: R.eq, dia: R.dayPnl || 0, paused: !!R.paused, killed: !!R.killed, abertas: (R.positions || []).length, maxPos: CFG.roboMaxPos, wins: closed.filter(c => c.why === 'WIN').length, losses: closed.filter(c => c.why === 'LOSS').length, historico: closed.slice(-10).reverse() };
+  return { ativo: CFG.robo, modo: CFG.bybitDemo ? 'DEMO (ordens reais em conta demo)' : 'PAPER', demo: !!CFG.bybitDemo, demoAbertas: [...DEMO_TRACK.keys()], eq: R.eq, dia: R.dayPnl || 0, paused: !!R.paused, killed: !!R.killed, abertas: (R.positions || []).length, maxPos: CFG.roboMaxPos, wins: closed.filter(c => c.why === 'WIN').length, losses: closed.filter(c => c.why === 'LOSS').length, historico: closed.slice(-10).reverse() };
 }
 
 /* ---------------- varredura ---------------- */
@@ -833,7 +931,7 @@ async function scanSymbol(sym){
   state.alertTs[key] = Date.now();
   state.alertsSent++;
   trackSignal(sym, res, perfil.hold);
-  if(CFG.robo) roboOpen(sym, res);
+  if(CFG.robo) await roboOpen(sym, res);
   saveState();
 }
 async function runScanCycle(){
@@ -1159,6 +1257,18 @@ if(isNode){
   } else {
     log('❌ Telegram: TELEGRAM_TOKEN vazio — confira a variável no Render → Environment');
   }
+  if(CFG.bybitDemo && !process.argv.includes('--selftest')){
+    if(!cryptoMod) log('❌ Bybit demo: módulo crypto indisponível');
+    else if(CFG.bybitKey && CFG.bybitSecret){
+      log('🟨 Bybit DEMO: validando chaves em api-demo.bybit.com...');
+      demoApi('GET', '/v5/account/wallet', { accountType: 'UNIFIED' }).then(r => {
+        const acc = (r && r.list && r.list[0]) || {};
+        const eq = parseFloat(acc.totalEquity) || 0;
+        log('🟨 Bybit DEMO conectada ✅ · equity demo ' + eq + ' USDT');
+        if(CFG.tgToken && CFG.tgChat) sendTelegram('🟨 CONTA DEMO conectada ✅\nEquity demo: ' + eq + ' USDT\nModo: ordens REAIS em conta demo (dinheiro virtual)\nDomínio: api-demo.bybit.com\nSL/TP registrados na Bolsa — disparam sozinhos');
+      }).catch(e => log('❌ Bybit demo FALHOU: ' + e.message + ' — confira BYBIT_API_KEY/SECRET e permissões (Read+Trade, sem restrição de IP)'));
+    } else log('⚠ BYBIT_DEMO=1 mas chaves vazias — modo demo inativo (configure BYBIT_API_KEY/SECRET no Render)');
+  }
   if(!process.argv.includes('--selftest')) startServer();
   if(CFG.btAuto){
     setTimeout(async () => {
@@ -1184,6 +1294,7 @@ if(isNode){
     if(CFG.tgToken && CFG.tgChat && !process.argv.includes('--selftest')) sendTelegram('🧪 ROBÔ PAPER ativo ✅\nEquity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nFuturos Bybit · alavancagem ' + CFG.roboLev + 'x · máx ' + CFG.roboMaxPos + ' posições\nKill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
     setInterval(() => roboTick().catch(e => log('roboTick: ' + e.message)), 30000);
     setInterval(() => roboCmd().catch(() => {}), 20000);
+    if(CFG.bybitDemo) setInterval(() => demoTick().catch(e => log('demoTick: ' + e.message)), 20000);
   }
 } else {
   globalThis.vgScan = runScanCycle;
