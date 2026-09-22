@@ -41,6 +41,7 @@ async function byKlines(sym, tf, limit){
   const ms = TF_MS[tf] || 900000;
   // Envelope novo→antigo da Bybit → formato Binance antigo→novo:
   // [0]openTime [1]open [2]high [3]low [4]close [5]volume [6]closeTime [9]takerBuy
+  if(list.length && list.length < Math.min(1000, limit)) warnOnce('curto:' + sym + ':' + tf, '⚠ ' + sym + ' ' + tf + ': histórico curto (' + list.length + ' velas de ' + limit + ') — indicadores longos podem ficar inválidos');
   return list.map(x => [+x[0], x[1], x[2], x[3], x[4], x[5], +x[0] + ms - 1, '0', '0', 0]).reverse();
 }
 async function byBook(sym, limit){
@@ -129,6 +130,8 @@ const CFG = {
   btRR: Math.min(5, Math.max(1, Number(ENV.BACKTEST_RR) || 2)),
   btMaxHoldBars: Math.max(4, Number(ENV.BACKTEST_MAX_HOLD_BARS) || 32),
   btAuto: String(ENV.BACKTEST_AUTO ?? '0') === '1',
+  btFolds: Math.max(2, Math.min(6, Number(ENV.BACKTEST_FOLDS) || 3)),
+  btFundBps: Math.min(20, Math.max(0, Number(ENV.BACKTEST_FUNDING_BPS) || 1)),
   port: Number(ENV.PORT) || 7860,
   stateFile: String(ENV.STATE_FILE || 'state.json')
 };
@@ -139,6 +142,8 @@ function log(msg){
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function aiRound(x){ if(x == null || !isFinite(x)) return null; const a = Math.abs(x); return a >= 1000 ? Number(x.toFixed(2)) : a >= 1 ? Number(x.toFixed(4)) : Number(x.toFixed(6)); }
+const WARN_ONCE = new Set();
+function warnOnce(key, msg){ if(WARN_ONCE.has(key)) return; WARN_ONCE.add(key); log(msg); }
 
 /* ---------------- anti-ban ----------------
    IPs de servidores gratuitos sao compartilhados e a Binance limita
@@ -645,16 +650,13 @@ function roboOpen(sym, res){
   if(R.positions.length >= CFG.roboMaxPos){ log('🤖 Robô: limite de ' + CFG.roboMaxPos + ' posições — ' + sym + ' ignorado'); return; }
   if(R.positions.some(p => p.sym === sym)) return;
   /* StoplossGuard (mecânica Freqtrade, only_per_pair): par que estopou 2x nas
-     últimas 12h fica travado — evita o suicídio de re-entradas (caso SUI 4x loss). */
+     últimas 12h fica travado — evita o suicídio de re-entradas (caso SUI 4x loss).
+     PROTEÇÃO GLOBAL REMOVIDA (auditoria, a pedido do usuário): a pausa de conta
+     inteira ("mercado contra o motor") bloqueava trades bons — caso TAO que deu
+     win mesmo bloqueado. Fica a proteção por par + cooldown pós-loss, que são
+     por ativo/direção e não engessam a conta. */
   const stopsPar = (R.closed || []).filter(t => t.sym === sym && t.why === 'LOSS' && Date.now() - t.ts < 12 * 3600000).length;
   if(stopsPar >= 2){ log('🤖 Robô: StoplossGuard — ' + sym + ' estopou ' + stopsPar + 'x em 12h, par travado'); return; }
-  /* StoplossGuard global: 3 stops em 6h = mercado contra o motor, pausa 2h (auto-retoma). */
-  if((R.closed || []).filter(t => t.why === 'LOSS' && Date.now() - t.ts < 6 * 3600000).length >= 3){
-    R.paused = true; R.pausedUntil = Date.now() + 2 * 3600000;
-    log('🤖 Robô: StoplossGuard global — 3 stops em 6h, pausa 2h');
-    sendAlert('🧊 ROBÔ PAPER: StoplossGuard global — 3 stops em 6h. Pausa de 2h (auto-retoma).');
-    return;
-  }
   const entry = Number(res.entrada), sl = Number(res.stop_loss), tp = Number(res.alvos && res.alvos[0]);
   if(!isFinite(entry) || !isFinite(sl) || !isFinite(tp) || entry <= 0) return;
   const side = res.direcao === 'SHORT' ? 'SHORT' : 'LONG';
@@ -700,11 +702,11 @@ async function roboTick(){
         const kl = await byKlines(p.sym, '1m', 30);
         const desde = kl.filter(c => Number(c[0]) >= p.ts - 60000);
         for(const c of desde){
-          const hi = +c[2], lo = +c[3];
-          const tSL = p.side === 'LONG' ? lo <= p.sl : hi >= p.sl;
-          const tTP = p.side === 'LONG' ? hi >= p.tp : lo <= p.tp;
-          if(tSL){ hitSL = true; exit = p.sl; break; }
-          if(tTP){ hitTP = true; exit = p.tp; break; }
+          const hit = CORE.evalBar(p, +c[2], +c[3]); if(hit){ if(hit.why === 'LOSS') hitSL = true; else hitTP = true; exit = hit.price; break; }
+          // trilho SL/TP via CORE (mesmo motor do backtest)
+          //
+          //
+          //
         }
       } catch(e){}
     }
@@ -857,6 +859,7 @@ async function runScanCycle(){
    Walk-Forward: minScore calibrado SÓ no treino (70%), aplicado no OOS/teste.
    Fluxo histórico = PROXY candle/volume (a API não fornece agressor histórico);
    o V11 ao vivo continua com os trades reais recentes da Bybit. */
+let LAST_BT_META = null;
 async function byKlinesDeep(sym, tf, want){
   const ms = TF_MS[tf] || TF_MS['15m'];
   let raw = [];
@@ -868,7 +871,86 @@ async function byKlinesDeep(sym, tf, want){
     if(list.length < 1000) break;
     await sleep(REQ_GAP_MS); // mesmo gap anti-ban do ciclo (coleta fora da fila)
   }
-  return raw.map(x => [+x[0], x[1], x[2], x[3], x[4], x[5], +x[0] + ms - 1, '0', '0', 0]).sort((a, b) => a[0] - b[0]);
+  const uniq = new Map();
+  for(const x of raw) uniq.set(+x[0], x);
+  const k = [...uniq.keys()].sort((a, b) => a - b).map(t => { const x = uniq.get(t); return [+t, x[1], x[2], x[3], x[4], x[5], +t + ms - 1, '0', '0', 0]; });
+  let gaps = 0;
+  for(let i = 1; i < k.length; i++) if(k[i][0] - k[i - 1][0] !== ms) gaps++;
+  LAST_BT_META = { solicitadas: want, recebidas: raw.length, recebidasDuplicadas: raw.length - uniq.size, unicas: k.length, gaps, aviso: k.length < want ? 'ativo novo ou histórico curto' : null };
+  return k;
+}
+/* ================= V12.3 · CORE ÚNICO (Backtest = Papel) =================
+   O mesmo trilho roda no papel (poll 30s + varredura de pavio) e no backtest (vela a vela):
+   - SL avaliado antes do TP na mesma vela (conservador);
+   - trailing nos mesmos níveis: 80% do caminho → trava 50%, 90% → trava 80%;
+   - custos realistas: taxa nos dois lados + slippage nos dois lados (pior no stop)
+     + funding aproximado proporcional ao tempo em posição. */
+const CORE = {
+  trail(pos, pos_price){ // pos_price: preço de referência (close da barra no backtest)
+    const price = pos_price, dirT = pos.side === 'LONG' ? 1 : -1;
+    const caminho = Math.abs(pos.tp - pos.entry);
+    if(!(caminho > 0)) return pos.sl;
+    const prog = (price - pos.entry) * dirT;
+    if((pos.trailLvl || 0) < 1 && prog >= 0.8 * caminho){ pos.sl = pos.entry + dirT * 0.5 * caminho; pos.trailLvl = 1; }
+    if((pos.trailLvl || 0) < 2 && prog >= 0.9 * caminho){ pos.sl = pos.entry + dirT * 0.8 * caminho; pos.trailLvl = 2; }
+    return pos.sl;
+  },
+  evalBar(pos, h, l){
+    const long = pos.side === 'LONG';
+    if(long ? l <= pos.sl : h >= pos.sl) return { why: 'LOSS', price: pos.sl };
+    if(long ? h >= pos.tp : l <= pos.tp) return { why: 'WIN', price: pos.tp };
+    return null;
+  }
+};
+function coreNet(grossR, bars, entry, exit, risk, why, fundBars){
+  const slipExit = CFG.btSlipBps * (why === 'LOSS' ? 1 : 0.5);
+  const fee = (entry + exit) * CFG.btFeeBps / 10000;
+  const slip = entry * CFG.btSlipBps / 10000 + exit * slipExit / 10000;
+  const fund = (bars / (fundBars || 32)) * (CFG.btFundBps / 10000) * entry;
+  return grossR - (fee + slip + fund) / risk;
+}
+function v12RegimeOf(b, h){
+  if(!b) return 'N/A';
+  if((b.atrPct || 0) > 2.5) return 'HIGH VOL';
+  const same = h && h.trend === b.trend && b.trend !== 'mixed';
+  const adx = Math.max(b.adx || 0, (h && h.adx) || 0);
+  if(same && adx >= 25) return b.trend === 'bull' ? 'TREND BULL' : 'TREND BEAR';
+  if(adx < 18) return 'RANGE';
+  return 'MIXED';
+}
+function v12Calibration(tr){
+  const buckets = [];
+  for(let lo = 50; lo < 100; lo += 5){
+    const g = tr.filter(t => t.score >= lo && t.score < lo + 5);
+    buckets.push({ score: lo + '-' + (lo + 4), trades: g.length, pWin: g.length ? +(100 * g.filter(t => t.r > 0).length / g.length).toFixed(1) : null, expR: g.length ? +(g.reduce((s, t) => s + t.r, 0) / g.length).toFixed(2) : null });
+  }
+  return buckets;
+}
+function v12Breakdown(tr){
+  const bd = (list) => ({ trades: list.length, winRate: list.length ? Math.round(100 * list.filter(t => t.r > 0).length / list.length) + '%' : '--', pnlR: +list.reduce((s, t) => s + t.r, 0).toFixed(2), expectancy: list.length ? +(list.reduce((s, t) => s + t.r, 0) / list.length).toFixed(2) : null });
+  const regimes = {}, porRegime = {};
+  for(const t of tr){ (regimes[t.reg] = regimes[t.reg] || []).push(t); }
+  Object.keys(regimes).forEach(k => porRegime[k] = bd(regimes[k]));
+  return { porLado: { LONG: bd(tr.filter(t => t.side === 'LONG')), SHORT: bd(tr.filter(t => t.side === 'SHORT')) }, porRegime };
+}
+async function runSelfTest(){
+  const resultados = [];
+  const t = (nome, ok, info) => resultados.push({ teste: nome, ok, info: String(info) });
+  try{
+    const k = await byKlinesDeep('BTCUSDT', '15m', 400);
+    t('ordem cronológica (antigo→novo)', k.length > 2 && k[0][0] < k[k.length - 1][0], 'primeiro ' + new Date(k[0][0]).toISOString());
+    t('sem duplicatas', new Set(k.map(x => x[0])).size === k.length, new Set(k.map(x => x[0])).size + '/' + k.length);
+    let gaps = 0;
+    for(let i = 1; i < k.length; i++) if(k[i][0] - k[i - 1][0] !== TF_MS['15m']) gaps++;
+    t('continuidade (sem buracos)', gaps === 0, gaps + ' buracos');
+    t('recebeu >= pediu', k.length >= 400, k.length + ' de 400');
+    t('meta de dados registrada', !!LAST_BT_META && LAST_BT_META.unicas === k.length, JSON.stringify(LAST_BT_META));
+    const kb2 = await byKlines('BTCUSDT', '15m', 50);
+    t('byKlines antigo→novo', kb2.length === 50 && kb2[0][0] < kb2[kb2.length - 1][0], 'último ' + new Date(kb2[kb2.length - 1][0]).toISOString());
+    const closed = k.filter(x => +x[6] <= Date.now());
+    t('motor usa somente candles fechados', closed.length === k.length, (k.length - closed.length) + ' abertos filtrados');
+  } catch(e){ t('execução', false, e.message); }
+  return { selfTest: 'paginador de candles', ok: resultados.every(x => x.ok), resultados };
 }
 function v12Resample(k, bucketMs){
   const map = new Map();
@@ -908,9 +990,10 @@ function v12Stats(tr){
   let cum = 0, peak = 0, dd = 0, streak = 0, maxStreak = 0;
   for(const r of tr.map(t => t.r)){ cum += r; if(cum > peak) peak = cum; dd = Math.min(dd, cum - peak); if(r <= 0){ streak++; if(streak > maxStreak) maxStreak = streak; } else streak = 0; }
   const mean = n ? tr.reduce((s, t) => s + t.r, 0) / n : 0;
+  const hasExc = n > 0 && tr[0].mae != null; const mMae = hasExc ? tr.reduce((s, t) => s + (t.mae || 0), 0) / n : null, mMfe = hasExc ? tr.reduce((s, t) => s + (t.mfe || 0), 0) / n : null;
   const std = n > 1 ? Math.sqrt(tr.reduce((s, t) => s + (t.r - mean) * (t.r - mean), 0) / (n - 1)) : 0;
   const fx = (a, b) => { const g = tr.filter(t => t.score >= a && t.score < b); return { trades: g.length, winRate: g.length ? Math.round(g.filter(t => t.r > 0).length / g.length * 100) + '%' : '--' }; };
-  return { trades: n, winRate: n ? Math.round(wins.length / n * 100) + '%' : '--', profitFactor: gl > 0 ? Math.round(gw / gl * 100) / 100 : (gw > 0 ? '∞' : 0), pnlR: Math.round(cum * 100) / 100, maxDrawdownR: Math.round(dd * 100) / 100, expectancy: Math.round(mean * 100) / 100, mediaR: Math.round(mean * 100) / 100, sharpe: std > 0 ? Math.round(mean / std * 100) / 100 : '∞', maxLossStreak: maxStreak, longShort: tr.filter(t => t.side === 'LONG').length + '/' + tr.filter(t => t.side === 'SHORT').length, faixas: { '55-64': fx(55, 65), '65-74': fx(65, 75), '75-84': fx(75, 85), '85+': fx(85, 101) } };
+  return { trades: n, winRate: n ? Math.round(wins.length / n * 100) + '%' : '--', profitFactor: gl > 0 ? Math.round(gw / gl * 100) / 100 : (gw > 0 ? '∞' : 0), pnlR: Math.round(cum * 100) / 100, maxDrawdownR: Math.round(dd * 100) / 100, expectancy: Math.round(mean * 100) / 100, mediaR: Math.round(mean * 100) / 100, sharpe: std > 0 ? Math.round(mean / std * 100) / 100 : '∞', maxLossStreak: maxStreak, avgMAE: mMae == null ? null : +mMae.toFixed(2), avgMFE: mMfe == null ? null : +mMfe.toFixed(2), longShort: tr.filter(t => t.side === 'LONG').length + '/' + tr.filter(t => t.side === 'SHORT').length, faixas: { '55-64': fx(55, 65), '65-74': fx(65, 75), '75-84': fx(75, 85), '85+': fx(85, 101) } };
 }
 async function v12Backtest(opt){
   const prof = PROFILES[opt.profile] || PROFILES[CFG.profile];
@@ -918,10 +1001,11 @@ async function v12Backtest(opt){
   const days = opt.days || CFG.btDays;
   const want = Math.min(6000, Math.ceil(days * 86400000 / ms) + 2);
   const kb = (await byKlinesDeep(opt.symbol, baseTf, want)).filter(x => +x[6] < Date.now());
+  const metaK = LAST_BT_META;
   if(kb.length < 500) return { erro: 'Histórico insuficiente (' + kb.length + ' velas de ' + baseTf + ') — reduza os dias ou o ativo é novo', ativo: opt.symbol, flowModel: 'PROXY candle/volume' };
   const kM = v12Resample(kb, TF_MS[prof.tfs[1]] || ms * 4), kH = v12Resample(kb, TF_MS[prof.tfs[2]] || ms * 16);
   const btcB = v12Resample((await byKlinesDeep('BTCUSDT', baseTf, want)).filter(x => +x[6] < Date.now()), TF_MS[prof.tfs[1]] || ms * 4);
-  const n = kb.length, nT = Math.floor(n * CFG.btTrainPct);
+  const n = kb.length, warm = 210, nT = Math.floor(n * CFG.btTrainPct);
   // passada 1: calcs cacheados por barra (janelas 100% fechadas, sem look-ahead)
   const ptrs = [0, 0], btPtr = 0;
   const C = [];
@@ -941,9 +1025,9 @@ async function v12Backtest(opt){
   // passada 2: simulação event-driven por candidato de minScore
   const sim = (minScore, iFrom, iTo) => {
     const trades = []; let busy = -1;
-    for(let i = Math.max(210, iFrom); i < iTo - 1; i++){
+    for(let i = Math.max(warm, iFrom); i < iTo - 1; i++){
       if(i <= busy) continue;
-      const c = C[i - 210];
+      const c = C[i - warm];
       if(!c || !c.b || c.m == null || c.h == null || !c.bt) continue;
       const sL = v12ScoreW(c.b, c.m, c.h, c.bt.trend, 'LONG'), sS = v12ScoreW(c.b, c.m, c.h, c.bt.trend, 'SHORT');
       const side = sL > sS ? 'LONG' : 'SHORT', sc = Math.max(sL, sS);
@@ -952,25 +1036,25 @@ async function v12Backtest(opt){
       if(!(risk > 0)) continue;
       const o = +kb[i + 1][1];
       const entry = o * (1 + (long ? 1 : -1) * CFG.btSlipBps / 10000);
-      const sl = long ? entry - risk : entry + risk;
-      const tp = long ? entry + CFG.btRR * risk : entry - CFG.btRR * risk;
+      const pos = { side, entry, sl: long ? entry - risk : entry + risk, trailLvl: 0 };
+      pos.tp = long ? entry + CFG.btRR * risk : entry - CFG.btRR * risk; const reg = v12RegimeOf(c.b, c.h); let mae = 0, mfe = 0;
       let exit = null, why = 'TIME', iOut = -1;
       for(let q = i + 1; q < Math.min(iTo, i + 1 + CFG.btMaxHoldBars); q++){
         const h = +kb[q][2], l = +kb[q][3], c2 = +kb[q][4];
-        if(long ? l <= sl : h >= sl){ exit = sl; why = 'SL'; iOut = q; break; }
-        if(long ? h >= tp : l <= tp){ exit = tp; why = 'TP'; iOut = q; break; }
-        exit = c2; iOut = q;
+        const adv = (long ? (l - entry) : (entry - h)) / risk, fav = (long ? (h - entry) : (entry - l)) / risk; if(adv < mae) mae = adv; if(fav > mfe) mfe = fav;
+        const hit = CORE.evalBar(pos, h, l); if(hit){ exit = hit.price; why = hit.why; iOut = q; break; }
+        CORE.trail(pos, c2); exit = c2; iOut = q;
       }
       if(exit == null || iOut >= iTo) continue;
-      const feeR = (entry + exit) * CFG.btFeeBps / 10000 / risk;
-      trades.push({ side, score: sc, r: (long ? exit - entry : entry - exit) / risk - feeR, why });
+      const net = coreNet((long ? exit - entry : entry - exit) / risk, iOut - i, entry, exit, risk, why, (8 * 3600000) / ms);
+      trades.push({ side, score: sc, r: net, why, reg, mae: +mae.toFixed(2), mfe: +mfe.toFixed(2) });
       busy = iOut;
     }
     return trades;
   };
-  let best = null;
+  let best = null; const folds = CFG.btFolds, warm2 = 210; const oosLen = Math.floor((n - warm2) / (folds + 1)); const foldResults = [], allAll = [];
   for(const msx of [55, 60, 65, 70, 75, 80]){
-    const tr = sim(msx, 210, nT);
+    const tr = sim(msx, 210, warm2 + oosLen);
     if(tr.length < Math.max(5, Math.floor(CFG.btMinTrades / 2))) continue;
     const st = v12Stats(tr);
     if(!best || st.expectancy > best.st.expectancy) best = { ms: msx, st };
@@ -979,8 +1063,24 @@ async function v12Backtest(opt){
     const all = sim(55, 210, nT);
     return { erro: 'Treino sem amostra suficiente para calibrar o minScore com honestidade', ativo: opt.symbol, perfil: prof.nome, velas: n, tradesNoTreino: all.length, flowModel: 'PROXY candle/volume' };
   }
-  const oos = sim(best.ms, nT, n);
-  return { ativo: opt.symbol, perfil: prof.nome, velas: n, dias: days, flowModel: 'PROXY candle/volume', aviso: 'Fluxo histórico é proxy candle/volume; o vivo usa trades reais Bybit', walkForward: { treino: { velas: nT - 210, minScoreEscolhido: best.ms, ...best.st }, oos: { velas: n - nT, ...v12Stats(oos) } }, config: { feeBps: CFG.btFeeBps, slippageBps: CFG.btSlipBps, rr: CFG.btRR, maxHoldBars: CFG.btMaxHoldBars } };
+  for(let f = 0; f < folds; f++){
+    const oosFrom = warm2 + oosLen * (f + 1), oosTo = f === folds - 1 ? n : oosFrom + oosLen;
+    if(oosTo - oosFrom < 20) continue;
+    let bestF = null;
+    for(const msx of [55, 60, 65, 70, 75, 80]){
+      const trF = sim(msx, 210, oosFrom);
+      if(trF.length < Math.max(5, Math.floor(CFG.btMinTrades / 2))) continue;
+      const stF = v12Stats(trF);
+      if(!bestF || stF.expectancy > bestF.st.expectancy) bestF = { ms: msx, st: stF };
+    }
+    const msUse = bestF ? bestF.ms : (best ? best.ms : 55);
+    const trO = sim(msUse, oosFrom, oosTo);
+    trO.forEach(t => { t.fold = f + 1; });
+    allAll.push(...trO);
+    foldResults.push({ fold: f + 1, velasOOS: oosTo - oosFrom, minScoreTreino: msUse, amostraTreino: bestF ? bestF.st.trades : 0, trades: trO.length, winRate: trO.length ? Math.round(100 * trO.filter(t => t.r > 0).length / trO.length) + '%' : '--', pnlR: +trO.reduce((s, t) => s + t.r, 0).toFixed(2) });
+  }
+  const tot = v12Stats(allAll);
+  return { ativo: opt.symbol, perfil: prof.nome, velas: n, dias: days, flowModel: 'PROXY candle/volume', aviso: 'Fluxo histórico é proxy candle/volume; o vivo usa trades reais Bybit', dados: { ...(metaK || {}), fechadas: kb.length }, walkForwardRolling: { folds: CFG.btFolds, resultados: foldResults, total: tot, breakdown: v12Breakdown(allAll), calibracao: v12Calibration(allAll) }, config: { feeBps: CFG.btFeeBps, slippageBps: CFG.btSlipBps, fundingBpsPor8h: CFG.btFundBps, rr: CFG.btRR, maxHoldBars: CFG.btMaxHoldBars } };
 }
 
 /* ---------------- status HTTP ---------------- */
@@ -993,6 +1093,11 @@ function scoreSummary(){
 function startServer(){
   const http = require('http');
   http.createServer(async (req, res) => {
+    if(req.url.startsWith('/selftest')){
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      try { res.end(JSON.stringify(await runSelfTest(), null, 2)); } catch(e){ res.end(JSON.stringify({ erro: 'selftest: ' + e.message }, null, 2)); }
+      return;
+    }
     if(req.url.startsWith('/backtest')){
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       try{
@@ -1001,6 +1106,26 @@ function startServer(){
         const d = Math.min(365, Math.max(7, Number(u.searchParams.get('days')) || CFG.btDays));
         const p = u.searchParams.get('profile') || CFG.profile;
         log('🔬 V12 backtest: ' + sym + ' · ' + d + ' dias · ' + p + ' (coleta profunda pode levar alguns segundos)');
+        if(u.searchParams.get('multi')){
+          const syms = u.searchParams.get('multi').split(',').map(s => s.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '')).filter(Boolean).slice(0, 6);
+          log('📊 comparativo por ativo: ' + syms.join(', '));
+          const comp = [];
+          for(const s2 of syms){
+            try{ const r2 = await v12Backtest({ symbol: s2, days: d, profile: p }); comp.push(r2.erro ? { ativo: s2, erro: r2.erro } : { ativo: s2, dados: r2.dados, total: r2.walkForwardRolling.total, breakdown: r2.walkForwardRolling.breakdown }); } catch(e){ comp.push({ ativo: s2, erro: e.message }); }
+            await sleep(1200);
+          }
+          res.end(JSON.stringify({ comparativoPorAtivo: comp }, null, 2));
+          return;
+        }
+        if(u.searchParams.get('allProfiles')){
+          const comps = [];
+          for(const p2 of ['padrao', 'scalp', 'swing']){
+            try{ const r2 = await v12Backtest({ symbol: sym, days: d, profile: p2 }); comps.push(r2.erro ? { perfil: p2, erro: r2.erro } : { perfil: p2, dados: r2.dados, total: r2.walkForwardRolling.total }); } catch(e){ comps.push({ perfil: p2, erro: e.message }); }
+            await sleep(1000);
+          }
+          res.end(JSON.stringify({ comparativoPorTimeframe: comps }, null, 2));
+          return;
+        }
         res.end(JSON.stringify(await v12Backtest({ symbol: sym, days: d, profile: p }), null, 2));
       }catch(e){ res.end(JSON.stringify({ erro: 'backtest: ' + e.message }, null, 2)); }
       return;
@@ -1015,7 +1140,7 @@ function startServer(){
       ciclos: state.cycles, alertasEnviados: state.alertsSent,
       placar: scoreSummary(), sinais: state.signals.slice(-20).reverse(),
       vereditos: state.verdicts, robo: roboSummary(),
-      backtest: { disponivel: true, exemplo: '/backtest?symbol=BTCUSDT&days=90', auto: CFG.btAuto }
+      backtest: { disponivel: true, exemplo: '/backtest?symbol=BTCUSDT&days=90', multi: '/backtest?multi=BTCUSDT,SOLUSDT,SUIUSDT&days=90', porTimeframe: '/backtest?symbol=BTCUSDT&days=90&allProfiles=1', folds: CFG.btFolds, auto: CFG.btAuto }, selfTest: { arg: 'node bot.js --selftest', url: '/selftest' }
     }, null, 2));
   }).listen(CFG.port, () => log('🌐 Status HTTP na porta ' + CFG.port));
 }
@@ -1023,6 +1148,9 @@ function startServer(){
 /* ---------------- boot ---------------- */
 if(isNode){
   loadState();
+  if(process.argv.includes('--selftest')){
+    runSelfTest().then(r => { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }).catch(e => { console.error('selfTest falhou: ' + e.message); process.exit(1); });
+  }
   log('🤖 VINGADOR BOT 24H iniciado · perfil ' + PROFILES[CFG.profile].nome + ' (' + PROFILES[CFG.profile].tfs.join('/') + ') · ' + CFG.watchlist.length + ' ativos · ciclo ' + CFG.intervalMin + 'min' + (CFG.gateOn ? ' · selo V11 ON' : ' · selo V11 OFF'));
   // Diagnóstico de credenciais (mascarado — nunca imprime o token completo):
   if(CFG.tgToken){
@@ -1031,29 +1159,29 @@ if(isNode){
   } else {
     log('❌ Telegram: TELEGRAM_TOKEN vazio — confira a variável no Render → Environment');
   }
-  startServer();
+  if(!process.argv.includes('--selftest')) startServer();
   if(CFG.btAuto){
     setTimeout(async () => {
       log('🔬 V12: BACKTEST_AUTO=1 — rodando walk-forward nos 3 primeiros ativos (coleta profunda)');
       for(const sym of CFG.watchlist.slice(0, 3)){
         try{
           const r = await v12Backtest({ symbol: sym });
-          log('🔬 V12 ' + sym + ': ' + (r.erro ? 'ERRO — ' + r.erro : 'minScore ' + r.walkForward.treino.minScoreEscolhido + ' · OOS ' + JSON.stringify(r.walkForward.oos)));
+          log('🔬 V12 ' + sym + ': ' + (r.erro ? 'ERRO — ' + r.erro : 'folds ' + r.walkForwardRolling.folds + ' · OOS ' + r.walkForwardRolling.total.trades + ' trades · WR ' + r.walkForwardRolling.total.winRate + ' · pnl ' + r.walkForwardRolling.total.pnlR + 'R · exp ' + r.walkForwardRolling.total.expectancy));
           await sleep(3000);
         }catch(e){ log('🔬 V12 ' + sym + ': ' + e.message); }
       }
     }, 25000);
   }
   if(CFG.tgToken && CFG.tgChat){
-    sendTelegram('🤖 VINGADOR BOT 24H online ✅\nPerfil: ' + PROFILES[CFG.profile].nome + ' (' + PROFILES[CFG.profile].tfs.join('/') + ')\nAtivos: ' + CFG.watchlist.join(', ') + '\nCiclo: a cada ' + CFG.intervalMin + 'min\n🛡 Selo V11: ' + (CFG.gateOn ? 'ativo' : 'desligado'));
+    if(!process.argv.includes('--selftest')) sendTelegram('🤖 VINGADOR BOT 24H online ✅\nPerfil: ' + PROFILES[CFG.profile].nome + ' (' + PROFILES[CFG.profile].tfs.join('/') + ')\nAtivos: ' + CFG.watchlist.join(', ') + '\nCiclo: a cada ' + CFG.intervalMin + 'min\n🛡 Selo V11: ' + (CFG.gateOn ? 'ativo' : 'desligado'));
   }
-  runScanCycle().catch(e => log('ciclo inicial: ' + e.message));
+  if(!process.argv.includes('--selftest')) runScanCycle().catch(e => log('ciclo inicial: ' + e.message));
   setInterval(() => runScanCycle().catch(e => log('ciclo: ' + e.message)), CFG.intervalMin * 60000);
   setInterval(() => scoreTick().catch(() => {}), 30000);
   if(CFG.robo){
     roboEnsure();
     log('🧪 ROBÔ PAPER ativo · equity virtual ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '%/trade · máx ' + CFG.roboMaxPos + ' posições · kill diário -' + (CFG.roboDailyStop * 100) + '% · futuros ' + CFG.roboLev + 'x');
-    if(CFG.tgToken && CFG.tgChat) sendTelegram('🧪 ROBÔ PAPER ativo ✅\nEquity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nFuturos Bybit · alavancagem ' + CFG.roboLev + 'x · máx ' + CFG.roboMaxPos + ' posições\nKill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
+    if(CFG.tgToken && CFG.tgChat && !process.argv.includes('--selftest')) sendTelegram('🧪 ROBÔ PAPER ativo ✅\nEquity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nFuturos Bybit · alavancagem ' + CFG.roboLev + 'x · máx ' + CFG.roboMaxPos + ' posições\nKill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
     setInterval(() => roboTick().catch(e => log('roboTick: ' + e.message)), 30000);
     setInterval(() => roboCmd().catch(() => {}), 20000);
   }
