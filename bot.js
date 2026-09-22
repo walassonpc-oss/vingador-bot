@@ -120,6 +120,15 @@ const CFG = {
   roboDailyStop: Math.min(0.1, Number(ENV.ROBO_DAILY_STOP) || 0.03),    // kill switch: -3% no dia
   roboLev: Math.max(1, Math.min(20, Number(ENV.ROBO_LEV) || 5)),        // alavancagem 5x (teto 20x)
   roboMetaPct: Math.min(10, Number(ENV.ROBO_META_PCT) || 1.5),          // meta diária: 1.5% da equity (escala com a conta)
+  // V12 · Backtest + Walk-Forward (blueprint do auditor V12):
+  btDays: Math.min(365, Math.max(7, Number(ENV.BACKTEST_DAYS) || 90)),
+  btFeeBps: Math.min(50, Math.max(0, Number(ENV.BACKTEST_FEE_BPS) || 5.5)),
+  btSlipBps: Math.min(50, Math.max(0, Number(ENV.BACKTEST_SLIPPAGE_BPS) || 2)),
+  btTrainPct: Math.min(0.9, Math.max(0.5, Number(ENV.BACKTEST_TRAIN_PCT) || 0.70)),
+  btMinTrades: Math.max(10, Number(ENV.BACKTEST_MIN_TRADES) || 30),
+  btRR: Math.min(5, Math.max(1, Number(ENV.BACKTEST_RR) || 2)),
+  btMaxHoldBars: Math.max(4, Number(ENV.BACKTEST_MAX_HOLD_BARS) || 32),
+  btAuto: String(ENV.BACKTEST_AUTO ?? '0') === '1',
   port: Number(ENV.PORT) || 7860,
   stateFile: String(ENV.STATE_FILE || 'state.json')
 };
@@ -196,19 +205,20 @@ function v11Adx(k, p = 14){ if(k.length < 2 * p + 5) return null; let tr = [], p
 function v11Corr(a, b){ const n = Math.min(60, a.length - 1, b.length - 1); if(n < 20) return null; const ra = [], rb = []; for(let i = a.length - n; i < a.length; i++) ra.push((a[i] - a[i - 1]) / (a[i - 1] || 1)); for(let i = b.length - n; i < b.length; i++) rb.push((b[i] - b[i - 1]) / (b[i - 1] || 1)); const m = Math.min(ra.length, rb.length); const ma = ra.reduce((x, y) => x + y, 0) / m, mb = rb.reduce((x, y) => x + y, 0) / m; let num = 0, da = 0, db = 0; for(let i = 0; i < m; i++){ const x = ra[i] - ma, y = rb[i] - mb; num += x * y; da += x * x; db += y * y; } const den = Math.sqrt(da * db); return den ? num / den : null; }
 function v11TrendScore(c){ if(!c) return 0; let x = 0; if(c.e9 > c.e21) x += 8; else x -= 8; if(c.e21 > c.e50) x += 7; else x -= 7; if(c.e50 > c.e200) x += 5; else x -= 5; if(c.r >= 52 && c.r <= 68) x += 8; else if(c.r > 70 || c.r < 30) x -= 5; if(c.adx >= 25) x += 7; else if(c.adx < 18) x -= 4; return x; }
 function v11Regime(c1, c4){ const same = c1.trend === c4.trend && c1.trend !== 'mixed', adx = Math.max(c1.adx || 0, c4.adx || 0), atr = c1.atrPct || 0; if(atr > 2.5) return { name: 'HIGH VOLATILITY', quality: 'CUIDADO' }; if(same && adx >= 25) return { name: c1.trend === 'bull' ? 'TREND BULL' : 'TREND BEAR', quality: 'FORTE' }; if(adx < 18) return { name: 'RANGE', quality: 'BAIXA' }; return { name: 'MIXED / TRANSIÇÃO', quality: 'MÉDIA' }; }
-function v11Calc(k){
+function v11Calc(k, withFlow){
   k = (Array.isArray(k) ? k : []).filter(x => Number(x[6]) <= Date.now());
   const c = k.map(x => +x[4]), v = k.map(x => +x[5]);
   const e9 = v11EMA(c, 9), e21 = v11EMA(c, 21), e50 = v11EMA(c, 50), e200 = c.length >= 200 ? v11EMA(c, 200) : null;
   const r = v11RSI(c), atr = v11ATR(k), adx = v11Adx(k);
   const avg = v.slice(-21, -1).reduce((a, b) => a + b, 0) / Math.max(1, v.slice(-21, -1).length);
   let tR, takerImbalance;
-  if(FLOW){ tR = FLOW.ratio; takerImbalance = FLOW.imb; }
+  if(withFlow && FLOW){ tR = FLOW.ratio; takerImbalance = FLOW.imb; }
   else {
     const tb = k.map(x => +x[9] || 0), n20 = Math.min(20, v.length);
     const buy20 = tb.slice(-n20).reduce((a, b) => a + b, 0), vol20 = v.slice(-n20).reduce((a, b) => a + b, 0);
-    tR = buy20 / (vol20 || 1);
-    takerImbalance = vol20 ? (2 * buy20 - vol20) / vol20 : 0;
+    const hasTb = tb.some(x => x > 0);
+    tR = hasTb ? buy20 / (vol20 || 1) : null;
+    takerImbalance = hasTb ? (2 * buy20 - vol20) / vol20 : null;
   }
   return { close: c.at(-1), prev: c.at(-2), e9, e21, e50, e200, r, atr, atrPct: atr / c.at(-1) * 100, adx, vol: v.at(-1), volRatio: v.at(-1) / (avg || 1), takerRatio: tR, takerImbalance, cvdBias: takerImbalance, trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed', high20: Math.max(...k.slice(-20).map(x => +x[2])), low20: Math.min(...k.slice(-20).map(x => +x[3])) };
 }
@@ -235,7 +245,7 @@ async function buildContext(sym, tfs){
     () => byBook(sym, 50).catch(() => null),
     () => byTrades(sym).catch(() => [])
   ]);
-  const calc = (k) => {
+  const calc = (k, withFlow) => {
     k = (Array.isArray(k) ? k : []).filter(x => Number(x[6]) <= Date.now());
     const c = k.map(x => +x[4]), v = k.map(x => +x[5]);
     const e9 = aiEma(c, 9), e21 = aiEma(c, 21), e50 = aiEma(c, 50), e200 = c.length >= 200 ? aiEma(c, 200) : null, r = aiRsi(c), a = aiAtr(k), adx = aiAdx(k);
@@ -245,18 +255,21 @@ async function buildContext(sym, tfs){
     const lastK = k[k.length - 1];
     const lastRange = lastK ? (+lastK[2] - +lastK[3]) : null;
     let takerRatio, takerImbalance;
-    if(FLOW){ takerRatio = FLOW.ratio; takerImbalance = FLOW.imb; }
+    if(withFlow && FLOW){ takerRatio = FLOW.ratio; takerImbalance = FLOW.imb; }
     else {
       const tb = k.map(x => +x[9] || 0), n20 = Math.min(20, v.length);
       const vol20 = v.slice(-n20).reduce((x, y) => x + y, 0) || 1;
       const buy20 = tb.slice(-n20).reduce((x, y) => x + y, 0);
-      takerRatio = buy20 / vol20;
-      takerImbalance = (2 * buy20 - vol20) / vol20;
+      /* Fonte sem campo agressor (klines da Bybit não têm)? Nulo = fator
+         falha seguro, em vez de veredito "agressor vendedor" fabricado. */
+      const hasTb = tb.some(x => x > 0);
+      takerRatio = hasTb ? buy20 / vol20 : null;
+      takerImbalance = hasTb ? (2 * buy20 - vol20) / vol20 : null;
     }
     return { close: aiRound(last), prevClose: aiRound(prev), rsi: aiRound(r), ema9: aiRound(e9), ema21: aiRound(e21), ema50: aiRound(e50), ema200: e200 == null ? null : aiRound(e200), atr: aiRound(a), atrPct: aiRound(a / last * 100), adx: aiRound(adx), volume: aiRound(vol), volumeRatio: aiRound(vol / (vavg || 1)), high30: aiRound(Math.max(...highs)), low30: aiRound(Math.min(...lows)), lastRange: lastRange == null ? null : aiRound(lastRange), takerRatio: aiRound(takerRatio), takerImbalance: aiRound(takerImbalance), cvdBias: aiRound(takerImbalance), trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed' };
   };
   FLOW = flowFromTrades(trades);
-  const cA = calc(kA), cB = calc(kB), cC = calc(kC);
+  const cA = calc(kA, true), cB = calc(kB), cC = calc(kC);
   FLOW = null;
   const k7Closed = (Array.isArray(k7d) ? k7d : []).filter(x => Number(x[6]) <= Date.now());
   const c7First = +(k7Closed[0]?.[1] || 0), c7Last = +(k7Closed.at(-1)?.[4] || 0);
@@ -294,10 +307,15 @@ function localChecklist(ctx, side){
     a_tendencia_alinhada: A.trend === bull && B.trend === bull && C.trend === bull,
     b_momentum: A.rsi != null && (long ? A.rsi >= 50 && A.rsi <= 70 : A.rsi >= 30 && A.rsi <= 50),
     c_adx: [A, B, C].every(x => x.adx != null && x.adx >= 20),
-    d_fluxo: long ? [A, B, C].every(x => x.takerImbalance > 0 && x.takerRatio >= 0.5) : [A, B, C].every(x => x.takerImbalance < 0 && x.takerRatio <= 0.5),
+    /* Fluxo honesto (auditoria V12): o snapshot de 1000 negociações cobre
+       honestamente a janela do 1º TF — não dá pra fingir "3 TFs every" com
+       o mesmo valor. Falha seguro se a fonte não tiver taker. */
+    d_fluxo: A.takerImbalance != null && (long ? (A.takerImbalance > 0 && A.takerRatio >= 0.5) : (A.takerImbalance < 0 && A.takerRatio <= 0.5)),
     e_oi: ctx.oiChange6h != null && (long ? (ctx.oiChange6h >= 0 && subiu) : (ctx.oiChange6h >= 0 && !subiu)),
     f_estrutura: A.ema21 != null && (long ? A.close > A.ema21 : A.close < A.ema21),
-    g_btc: [ctx.btc['1h'].trend, ctx.btc['4h'].trend].every(t => t === bull || t === 'mixed'),
+    // Anti-drift: short so com BTC 4h bear de verdade (long aceita misto).
+    g_btc: long ? [ctx.btc['1h'].trend, ctx.btc['4h'].trend].every(t => t === 'bull' || t === 'mixed')
+                : (ctx.btc['4h'].trend === 'bear' && (ctx.btc['1h'].trend === 'bear' || ctx.btc['1h'].trend === 'mixed')),
     h_derivativos: Math.abs(ctx.funding) <= 0.15 && (ctx.spreadBps == null || ctx.spreadBps <= 15)
   };
 }
@@ -345,8 +363,12 @@ function localDecision(ctx){
   /* R:R estrutural mínimo: só valida se houver espaço até a estrutura (topos/fundos
      de 30 candles) para pelo menos MIN_RR_ESTRUTURAL x o risco da operação. */
   const roomRR = long ? (A.high30 - entry) / risk : (entry - A.low30) / risk;
-  const rrOk = roomRR >= 1.3;
-  const valida = !tie && nTrue >= 5 && fk.d_fluxo && spreadOk && !spike && rrOk;
+  /* Drift tax (vies long do varejo): o short paga imposto — precisa de mais
+     espaço estrutural (1.5x) que o long (1.3x) pra correr a cena. */
+  const rrOk = roomRR >= (long ? 1.3 : 1.5);
+  /* Tres OBRIGATORIOS (mecanica V11): fluxo + tendencia + estrutura. Sem cena
+     estruturada = fatiado contra-tendencia (o massacre de 6 losses num dia de queda). */
+  const valida = !tie && nTrue >= 5 && fk.d_fluxo && fk.a_tendencia_alinhada && fk.f_estrutura && spreadOk && !spike && rrOk;
   let conf = 30 + nTrue * 9;
   if(asiaScalp) conf -= 10;
   const just = Object.keys(fk).filter(k => fk[k]).map(k => V11_FACTOR_LABELS[k]);
@@ -384,7 +406,9 @@ async function v11Gate(sym){
   const fund = tkr.fund, oi = tkr.oi, t24 = { quoteVolume: tkr.t24.quoteVolume };
   if(!Array.isArray(k15) || !k15.length || !Array.isArray(k1) || !k1.length || !Array.isArray(k4) || !k4.length || !Array.isArray(b1) || !b1.length || !Array.isArray(b4) || !b4.length) throw new Error('Histórico insuficiente para V11');
   FLOW = flowFromTrades(trades);
-  const c15 = v11Calc(k15), c1 = v11Calc(k1), c4 = v11Calc(k4);
+  /* Fluxo honesto (auditoria V12): o snapshot cobre a janela do 15m —
+     c1/c4 não fingem fluxo próprio (a fonte não tem agressor por TF). */
+  const c15 = v11Calc(k15, true), c1 = v11Calc(k1), c4 = v11Calc(k4);
   FLOW = null;
   const btc1 = v11Calc(b1), btc4 = v11Calc(b4);
   const regime = v11Regime(c1, c4);
@@ -425,7 +449,9 @@ async function v11Gate(sym){
   oiSample(sym, oiValBy);
   const oiChg6h = oiChange(sym, oiValBy, 6);
   const px6h = k1.length >= 7 ? (+k1[k1.length - 1][4] / +k1[k1.length - 7][4] - 1) * 100 : 0;
-  const cvdScore = v11Clamp((c15.takerImbalance * 10 + c1.takerImbalance * 8 + c4.takerImbalance * 4) / 1.2, -12, 12);
+  /* Peso único no 15m (auditoria V12): pesava o MESMO snapshot três vezes
+     (10+8+4) — teatro matemático. Granularidade real: saturação em ±1.5. */
+  const cvdScore = v11Clamp((c15.takerImbalance || 0) * 8, -12, 12);
   const flow = v11Clamp(cvdScore + v11Clamp(imb * 8, -6, 6) + v11Clamp(whaleBias * 5, -5, 5), -22, 22);
   let oiScore = 0;
   if(oiChg6h !== null){ if(oiChg6h > 0.5 && px6h > 0) oiScore = 7; else if(oiChg6h > 0.5 && px6h < 0) oiScore = -7; else if(oiChg6h < -0.5) oiScore = -2; }
@@ -444,7 +470,9 @@ async function v11Gate(sym){
   const score = Math.round(v11Clamp(rawScore - penalty, 0, 100));
   let gate = score >= 75 && penalty < 25 && regime.name !== 'RANGE' ? 'ENTRADA POTENCIAL' : score >= 60 ? 'AGUARDAR CONFIRMAÇÃO' : 'BLOQUEADO';
   if(regime.name === 'HIGH VOLATILITY') gate = 'BLOQUEADO';
-  if(gate === 'ENTRADA POTENCIAL' && flow < -8) gate = 'AGUARDAR CONFIRMAÇÃO';
+  /* Espelho de direção removido daqui: era cego ao lado e punia o fluxo
+     ALINHADO ao SHORT (flow < -8 em um SHORT é ótimo). O espelho real
+     vive no call site, com o lado na mão. */
   return { score, gate, penalty, flow, imb, fr, spreadBps, whaleBias, oiChg6h, regime: regime.name };
 }
 
@@ -460,7 +488,7 @@ function buildPlano(sym, res, perfil, v11){
     '🎯 Entrada: ' + fmtV(res.entrada) + '\n' +
     '🛑 Stop: ' + fmtV(res.stop_loss) + '\n' +
     '🏁 TP1: ' + fmtV(res.alvos?.[0]) + (res.alvos?.[1] !== undefined ? ' | TP2: ' + fmtV(res.alvos[1]) : '') + '\n' +
-    '⚖️ R:R 1:' + fmtV(res.rr) + ' · Confiança: ' + fmtV(res.confianca) + '%\n' +
+    '⚖️ R:R 1:' + fmtV(res.rr) + ' · Confluência: ' + fmtV(res.confianca) + '/100\n' +
     '⌛ Time stop: ' + (res.timeStopHoras ? res.timeStopHoras + 'h' : '--') + '\n' +
     '❌ Invalida se: ' + (res.invalidacao || '--') + '\n';
   if(v11) p += '🛡 Selo V11: ' + v11.gate + ' · score ' + v11.score + ' · regime ' + v11.regime + '\n';
@@ -612,9 +640,21 @@ function roboRelatorio(f){
 function roboOpen(sym, res){
   roboEnsure();
   const R = state.robo;
+  if(R.paused && R.pausedUntil && Date.now() > R.pausedUntil){ R.paused = false; delete R.pausedUntil; log('🤖 Robô: pausa do StoplossGuard expirou — retomando'); }
   if(R.paused || R.killed) return;
   if(R.positions.length >= CFG.roboMaxPos){ log('🤖 Robô: limite de ' + CFG.roboMaxPos + ' posições — ' + sym + ' ignorado'); return; }
   if(R.positions.some(p => p.sym === sym)) return;
+  /* StoplossGuard (mecânica Freqtrade, only_per_pair): par que estopou 2x nas
+     últimas 12h fica travado — evita o suicídio de re-entradas (caso SUI 4x loss). */
+  const stopsPar = (R.closed || []).filter(t => t.sym === sym && t.why === 'LOSS' && Date.now() - t.ts < 12 * 3600000).length;
+  if(stopsPar >= 2){ log('🤖 Robô: StoplossGuard — ' + sym + ' estopou ' + stopsPar + 'x em 12h, par travado'); return; }
+  /* StoplossGuard global: 3 stops em 6h = mercado contra o motor, pausa 2h (auto-retoma). */
+  if((R.closed || []).filter(t => t.why === 'LOSS' && Date.now() - t.ts < 6 * 3600000).length >= 3){
+    R.paused = true; R.pausedUntil = Date.now() + 2 * 3600000;
+    log('🤖 Robô: StoplossGuard global — 3 stops em 6h, pausa 2h');
+    sendAlert('🧊 ROBÔ PAPER: StoplossGuard global — 3 stops em 6h. Pausa de 2h (auto-retoma).');
+    return;
+  }
   const entry = Number(res.entrada), sl = Number(res.stop_loss), tp = Number(res.alvos && res.alvos[0]);
   if(!isFinite(entry) || !isFinite(sl) || !isFinite(tp) || entry <= 0) return;
   const side = res.direcao === 'SHORT' ? 'SHORT' : 'LONG';
@@ -630,7 +670,7 @@ function roboOpen(sym, res){
   const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), risk0: aiRound(riskDist), trailLvl: 0, qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), lev: CFG.roboLev, margin: Number(margin.toFixed(2)), liq: aiRound(liq), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
   R.positions.push(pos);
   log('🤖 ROBÔ PAPER #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
-  sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🏦 Margem ' + fmtV(margin) + ' · Liquidação ≈ ' + fmtV(liq) + '\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
+  sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🏦 Margem ' + fmtV(margin) + ' · Liq estimada ≈ ' + fmtV(liq) + '\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
 }
 async function roboTick(){
   roboEnsure();
@@ -775,10 +815,15 @@ async function scanSymbol(sym){
   let v11 = null;
   if(CFG.gateOn){
     try { v11 = await v11Gate(sym); } catch(e){ log('V11 falhou em ' + sym + ': ' + e.message); }
-    if(v11 && (v11.score < 60 || v11.gate === 'BLOQUEADO')){
-      log('🔒 ' + sym + ': checklist válida mas o V11 bloqueou (score ' + v11.score + ' · ' + v11.gate + ') — descartado');
-      state.verdicts[sym].blocked = true;
-      return;
+    if(v11){
+      /* Espelho direcional (auditoria V12): o Selo confirma a DIREÇÃO?
+         LONG exige fluxo alinhado (+8) e SHORT (-8) — mesma régua. */
+      const fluxoOk = res.direcao === 'LONG' ? v11.flow >= 8 : v11.flow <= -8;
+      if(v11.score < 60 || v11.gate === 'BLOQUEADO' || !fluxoOk){
+        log('🔒 ' + sym + ': checklist válida mas o V11 bloqueou (score ' + v11.score + ' · ' + v11.gate + ' · flow ' + v11.flow + ' vs ' + res.direcao + ') — descartado');
+        state.verdicts[sym].blocked = true;
+        return;
+      }
     }
   }
   const plano = buildPlano(sym, res, perfil, v11);
@@ -805,6 +850,139 @@ async function runScanCycle(){
   log('✅ Varredura concluída em ' + Math.round((Date.now() - t0) / 1000) + 's');
 }
 
+/* ================= V12 · BACKTEST EVENT-DRIVEN + WALK-FORWARD =================
+   (blueprint do auditor V12, implementado em cima do bot.js corrigido)
+   Entrada na abertura da vela seguinte · sem look-ahead · SL/TP por High/Low ·
+   SL e TP na mesma vela = SL primeiro (conservador) · taxas e slippage incluídos.
+   Walk-Forward: minScore calibrado SÓ no treino (70%), aplicado no OOS/teste.
+   Fluxo histórico = PROXY candle/volume (a API não fornece agressor histórico);
+   o V11 ao vivo continua com os trades reais recentes da Bybit. */
+async function byKlinesDeep(sym, tf, want){
+  const ms = TF_MS[tf] || TF_MS['15m'];
+  let raw = [];
+  for(let end = Date.now(); raw.length < want && raw.length < 6000; end -= 1000 * ms){
+    const r = await bbJson(`${BYBIT}/v5/market/kline?category=linear&symbol=${sym}&interval=${BYBIT_IV[tf] || '15'}&limit=1000&end=${end}`);
+    const list = (r.result && r.result.list) || [];
+    if(!list.length) break;
+    raw = raw.concat(list);
+    if(list.length < 1000) break;
+    await sleep(REQ_GAP_MS); // mesmo gap anti-ban do ciclo (coleta fora da fila)
+  }
+  return raw.map(x => [+x[0], x[1], x[2], x[3], x[4], x[5], +x[0] + ms - 1, '0', '0', 0]).sort((a, b) => a[0] - b[0]);
+}
+function v12Resample(k, bucketMs){
+  const map = new Map();
+  for(const x of k){ const b = Math.floor(+x[0] / bucketMs); if(!map.has(b)) map.set(b, []); map.get(b).push(x); }
+  const out = [];
+  for(const b of [...map.keys()].sort((a, c) => a - c)){
+    const g = map.get(b);
+    out.push([g[0][0], g[0][1], String(Math.max(...g.map(x => +x[2]))), String(Math.min(...g.map(x => +x[3]))), g[g.length - 1][4], String(g.reduce((s, x) => s + +x[5], 0)), g[g.length - 1][6]]);
+  }
+  return out;
+}
+function v12CalcW(w){ // indicadores de janela fixa + proxy de fluxo (candle/volume)
+  const c = w.map(x => +x[4]), v = w.map(x => +x[5]);
+  const e9 = aiEma(c, 9), e21 = aiEma(c, 21), e50 = aiEma(c, 50), e200 = c.length >= 200 ? aiEma(c, 200) : null, r = aiRsi(c), a = aiAtr(w), adx = aiAdx(w);
+  const close = c[c.length - 1];
+  let sv = 0, tv = 0;
+  for(const x of w.slice(-20)){ const hi = +x[2], lo = +x[3], o = +x[1], cl = +x[4], vol = +x[5]; const rng = (hi - lo) || cl * 1e-9; sv += vol * (2 * (cl - o) / rng - 1); tv += vol; }
+  return { close, e9, e21, e50, e200, rsi: r, atr: a, atrPct: a / close * 100, adx, volRatio: v[v.length - 1] / ((v.slice(-21, -1).reduce((s, y) => s + y, 0) / Math.max(1, v.slice(-21, -1).length)) || 1), flowImb: tv ? sv / tv : 0, trend: e200 != null && e9 > e21 && e21 > e50 && e50 > e200 ? 'bull' : e200 != null && e9 < e21 && e21 < e50 && e50 < e200 ? 'bear' : 'mixed' };
+}
+function v12ScoreW(b, m, h, btcT, side){ // confluência ponderada 0-100 (8 fatores do blueprint)
+  const long = side === 'LONG', tv = long ? 'bull' : 'bear';
+  let s = 0;
+  s += b.trend === tv ? 12 : (b.trend === 'mixed' ? 4 : 0);
+  if(m.trend === tv) s += 5; if(h.trend === tv) s += 3;
+  s += b.rsi != null && (long ? b.rsi >= 48 && b.rsi <= 70 : b.rsi >= 30 && b.rsi <= 52) ? 8 : (b.rsi != null && (b.rsi > 78 || b.rsi < 22) ? 0 : 4);
+  s += (b.adx != null && b.adx >= 25) ? 12 : ((b.adx != null && b.adx >= 20) ? 7 : 2);
+  s += long ? (b.flowImb > 0.15 ? 15 : b.flowImb > 0 ? 8 : 0) : (b.flowImb < -0.15 ? 15 : b.flowImb < 0 ? 8 : 0);
+  s += b.e21 != null && (long ? b.close > b.e21 : b.close < b.e21) ? 13 : 0;
+  s += btcT === tv ? 10 : (btcT === 'mixed' ? 4 : 0);
+  s += b.volRatio >= 1.5 ? 10 : b.volRatio >= 1 ? 6 : 2;
+  s += b.atrPct > 0.25 && b.atrPct < 1.8 ? 8 : (b.atrPct < 2.5 ? 4 : 0);
+  return Math.max(0, Math.min(100, Math.round(s)));
+}
+function v12Stats(tr){
+  const n = tr.length, wins = tr.filter(t => t.r > 0), losses = tr.filter(t => t.r <= 0);
+  const gw = wins.reduce((s, t) => s + t.r, 0), gl = Math.abs(losses.reduce((s, t) => s + t.r, 0));
+  let cum = 0, peak = 0, dd = 0, streak = 0, maxStreak = 0;
+  for(const r of tr.map(t => t.r)){ cum += r; if(cum > peak) peak = cum; dd = Math.min(dd, cum - peak); if(r <= 0){ streak++; if(streak > maxStreak) maxStreak = streak; } else streak = 0; }
+  const mean = n ? tr.reduce((s, t) => s + t.r, 0) / n : 0;
+  const std = n > 1 ? Math.sqrt(tr.reduce((s, t) => s + (t.r - mean) * (t.r - mean), 0) / (n - 1)) : 0;
+  const fx = (a, b) => { const g = tr.filter(t => t.score >= a && t.score < b); return { trades: g.length, winRate: g.length ? Math.round(g.filter(t => t.r > 0).length / g.length * 100) + '%' : '--' }; };
+  return { trades: n, winRate: n ? Math.round(wins.length / n * 100) + '%' : '--', profitFactor: gl > 0 ? Math.round(gw / gl * 100) / 100 : (gw > 0 ? '∞' : 0), pnlR: Math.round(cum * 100) / 100, maxDrawdownR: Math.round(dd * 100) / 100, expectancy: Math.round(mean * 100) / 100, mediaR: Math.round(mean * 100) / 100, sharpe: std > 0 ? Math.round(mean / std * 100) / 100 : '∞', maxLossStreak: maxStreak, longShort: tr.filter(t => t.side === 'LONG').length + '/' + tr.filter(t => t.side === 'SHORT').length, faixas: { '55-64': fx(55, 65), '65-74': fx(65, 75), '75-84': fx(75, 85), '85+': fx(85, 101) } };
+}
+async function v12Backtest(opt){
+  const prof = PROFILES[opt.profile] || PROFILES[CFG.profile];
+  const baseTf = prof.tfs[0], ms = TF_MS[baseTf] || TF_MS['15m'];
+  const days = opt.days || CFG.btDays;
+  const want = Math.min(6000, Math.ceil(days * 86400000 / ms) + 2);
+  const kb = (await byKlinesDeep(opt.symbol, baseTf, want)).filter(x => +x[6] < Date.now());
+  if(kb.length < 500) return { erro: 'Histórico insuficiente (' + kb.length + ' velas de ' + baseTf + ') — reduza os dias ou o ativo é novo', ativo: opt.symbol, flowModel: 'PROXY candle/volume' };
+  const kM = v12Resample(kb, TF_MS[prof.tfs[1]] || ms * 4), kH = v12Resample(kb, TF_MS[prof.tfs[2]] || ms * 16);
+  const btcB = v12Resample((await byKlinesDeep('BTCUSDT', baseTf, want)).filter(x => +x[6] < Date.now()), TF_MS[prof.tfs[1]] || ms * 4);
+  const n = kb.length, nT = Math.floor(n * CFG.btTrainPct);
+  // passada 1: calcs cacheados por barra (janelas 100% fechadas, sem look-ahead)
+  const ptrs = [0, 0], btPtr = 0;
+  const C = [];
+  for(let i = 210; i < n; i++){
+    const T = +kb[i][6];
+    const b = v12CalcW(kb.slice(Math.max(0, i - 219), i + 1));
+    const series = [kM, kH], R = [];
+    for(let s = 0; s < 2; s++){
+      while(ptrs[s] < series[s].length && +series[s][ptrs[s]][6] <= T) ptrs[s]++;
+      const w = series[s].slice(Math.max(0, ptrs[s] - 220), ptrs[s]);
+      R.push(w.length >= 210 ? v12CalcW(w) : null);
+    }
+    while(btPtr < btcB.length && +btcB[btPtr][6] <= T) btPtr++;
+    const bw = btcB.slice(Math.max(0, btPtr - 220), btPtr);
+    C.push({ b, m: R[0], h: R[1], bt: bw.length >= 210 ? v12CalcW(bw) : null });
+  }
+  // passada 2: simulação event-driven por candidato de minScore
+  const sim = (minScore, iFrom, iTo) => {
+    const trades = []; let busy = -1;
+    for(let i = Math.max(210, iFrom); i < iTo - 1; i++){
+      if(i <= busy) continue;
+      const c = C[i - 210];
+      if(!c || !c.b || c.m == null || c.h == null || !c.bt) continue;
+      const sL = v12ScoreW(c.b, c.m, c.h, c.bt.trend, 'LONG'), sS = v12ScoreW(c.b, c.m, c.h, c.bt.trend, 'SHORT');
+      const side = sL > sS ? 'LONG' : 'SHORT', sc = Math.max(sL, sS);
+      if(sc < minScore) continue;
+      const long = side === 'LONG', risk = 1.25 * c.b.atr;
+      if(!(risk > 0)) continue;
+      const o = +kb[i + 1][1];
+      const entry = o * (1 + (long ? 1 : -1) * CFG.btSlipBps / 10000);
+      const sl = long ? entry - risk : entry + risk;
+      const tp = long ? entry + CFG.btRR * risk : entry - CFG.btRR * risk;
+      let exit = null, why = 'TIME', iOut = -1;
+      for(let q = i + 1; q < Math.min(iTo, i + 1 + CFG.btMaxHoldBars); q++){
+        const h = +kb[q][2], l = +kb[q][3], c2 = +kb[q][4];
+        if(long ? l <= sl : h >= sl){ exit = sl; why = 'SL'; iOut = q; break; }
+        if(long ? h >= tp : l <= tp){ exit = tp; why = 'TP'; iOut = q; break; }
+        exit = c2; iOut = q;
+      }
+      if(exit == null || iOut >= iTo) continue;
+      const feeR = (entry + exit) * CFG.btFeeBps / 10000 / risk;
+      trades.push({ side, score: sc, r: (long ? exit - entry : entry - exit) / risk - feeR, why });
+      busy = iOut;
+    }
+    return trades;
+  };
+  let best = null;
+  for(const msx of [55, 60, 65, 70, 75, 80]){
+    const tr = sim(msx, 210, nT);
+    if(tr.length < Math.max(5, Math.floor(CFG.btMinTrades / 2))) continue;
+    const st = v12Stats(tr);
+    if(!best || st.expectancy > best.st.expectancy) best = { ms: msx, st };
+  }
+  if(!best){
+    const all = sim(55, 210, nT);
+    return { erro: 'Treino sem amostra suficiente para calibrar o minScore com honestidade', ativo: opt.symbol, perfil: prof.nome, velas: n, tradesNoTreino: all.length, flowModel: 'PROXY candle/volume' };
+  }
+  const oos = sim(best.ms, nT, n);
+  return { ativo: opt.symbol, perfil: prof.nome, velas: n, dias: days, flowModel: 'PROXY candle/volume', aviso: 'Fluxo histórico é proxy candle/volume; o vivo usa trades reais Bybit', walkForward: { treino: { velas: nT - 210, minScoreEscolhido: best.ms, ...best.st }, oos: { velas: n - nT, ...v12Stats(oos) } }, config: { feeBps: CFG.btFeeBps, slippageBps: CFG.btSlipBps, rr: CFG.btRR, maxHoldBars: CFG.btMaxHoldBars } };
+}
+
 /* ---------------- status HTTP ---------------- */
 function scoreSummary(){
   const rec = state.signals.slice(-20);
@@ -814,7 +992,19 @@ function scoreSummary(){
 }
 function startServer(){
   const http = require('http');
-  http.createServer((req, res) => {
+  http.createServer(async (req, res) => {
+    if(req.url.startsWith('/backtest')){
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      try{
+        const u = new URL(req.url, 'http://x');
+        const sym = (u.searchParams.get('symbol') || 'BTCUSDT').toUpperCase().replace(/[^A-Z0-9_]/g, '');
+        const d = Math.min(365, Math.max(7, Number(u.searchParams.get('days')) || CFG.btDays));
+        const p = u.searchParams.get('profile') || CFG.profile;
+        log('🔬 V12 backtest: ' + sym + ' · ' + d + ' dias · ' + p + ' (coleta profunda pode levar alguns segundos)');
+        res.end(JSON.stringify(await v12Backtest({ symbol: sym, days: d, profile: p }), null, 2));
+      }catch(e){ res.end(JSON.stringify({ erro: 'backtest: ' + e.message }, null, 2)); }
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
       bot: 'VINGADOR BOT 24H',
@@ -824,7 +1014,8 @@ function startServer(){
       ultimaVarredura: state.lastScan ? new Date(state.lastScan).toISOString() : null,
       ciclos: state.cycles, alertasEnviados: state.alertsSent,
       placar: scoreSummary(), sinais: state.signals.slice(-20).reverse(),
-      vereditos: state.verdicts, robo: roboSummary()
+      vereditos: state.verdicts, robo: roboSummary(),
+      backtest: { disponivel: true, exemplo: '/backtest?symbol=BTCUSDT&days=90', auto: CFG.btAuto }
     }, null, 2));
   }).listen(CFG.port, () => log('🌐 Status HTTP na porta ' + CFG.port));
 }
@@ -841,6 +1032,18 @@ if(isNode){
     log('❌ Telegram: TELEGRAM_TOKEN vazio — confira a variável no Render → Environment');
   }
   startServer();
+  if(CFG.btAuto){
+    setTimeout(async () => {
+      log('🔬 V12: BACKTEST_AUTO=1 — rodando walk-forward nos 3 primeiros ativos (coleta profunda)');
+      for(const sym of CFG.watchlist.slice(0, 3)){
+        try{
+          const r = await v12Backtest({ symbol: sym });
+          log('🔬 V12 ' + sym + ': ' + (r.erro ? 'ERRO — ' + r.erro : 'minScore ' + r.walkForward.treino.minScoreEscolhido + ' · OOS ' + JSON.stringify(r.walkForward.oos)));
+          await sleep(3000);
+        }catch(e){ log('🔬 V12 ' + sym + ': ' + e.message); }
+      }
+    }, 25000);
+  }
   if(CFG.tgToken && CFG.tgChat){
     sendTelegram('🤖 VINGADOR BOT 24H online ✅\nPerfil: ' + PROFILES[CFG.profile].nome + ' (' + PROFILES[CFG.profile].tfs.join('/') + ')\nAtivos: ' + CFG.watchlist.join(', ') + '\nCiclo: a cada ' + CFG.intervalMin + 'min\n🛡 Selo V11: ' + (CFG.gateOn ? 'ativo' : 'desligado'));
   }
