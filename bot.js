@@ -678,7 +678,8 @@ async function demoTick(){
         const risk = sl ? Math.abs(entry - sl) : 0;
         const prog = (mark - entry) * dir;
         if(risk > 0 && prog >= risk){
-          const half = String((parseFloat(p.size) * 0.5).toFixed(3));
+          const lotS = await demoQtyStep(p.symbol);
+          const half = String(demoQtyRound(parseFloat(p.size) * 0.5, lotS));
           try{
             await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.symbol, side: p.side === 'Buy' ? 'Sell' : 'Buy', orderType: 'Market', qty: half, reduceOnly: true, positionIdx: 0 });
             await demoApi('POST', '/v5/position/set-trading-stop', { category: 'linear', symbol: p.symbol, stopLoss: String(aiRound(entry + dir * 0.05 * risk)), positionIdx: 0 }).catch(() => {});
@@ -694,13 +695,40 @@ async function demoTick(){
         DEMO_TRACK.delete(sym2);
         DEMO_PART.delete(sym2);
         let rp = null;
-        try{
-          const c = await demoApi('GET', '/v5/position/closed-pnl', { category: 'linear', symbol: sym2, limit: 1 });
-          const item = (c && c.list && c.list[0]) || null;
-          if(item) rp = parseFloat(item.closedPnl) || 0;
-        } catch(e){}
+        /* closed-pnl pode demorar a registar o último fechamento; tenta 3x
+           antes de desistir (senão vitória corria risco de virar "loss" no placar). */
+        for(let t=0; t<3; t++){
+          try{
+            const c = await demoApi('GET', '/v5/position/closed-pnl', { category: 'linear', symbol: sym2, limit: 1 });
+            const item = (c && c.list && c.list[0]) || null;
+            if(item){ rp = parseFloat(item.closedPnl) || 0; break; }
+          } catch(e){}
+          await sleep(1500);
+        }
         log('🟨 DEMO posição fechada: ' + sym2 + (rp != null ? ' · PnL ' + rp.toFixed(4) : ''));
         sendAlert('🟨 DEMO: posição FECHADA na corretora\n' + sym2 + ' ' + side2 + (rp != null ? '\n📊 PnL realizado: ' + (rp >= 0 ? '+' : '') + rp.toFixed(4) + ' USDT' : '') + '\n🏆 Placar do bot');
+        // Reconcilia o papel com o número REAL da corretora (fonte da verdade):
+        const posV = (state.robo && (state.robo.positions || []).find(x => x.sym === sym2 && x.demoOrderId)) || null;
+        if(posV){
+          let pnlL, whyL, priceL;
+          if(rp != null){ pnlL = rp; whyL = rp >= 0 ? 'WIN' : 'LOSS'; priceL = whyL === 'WIN' ? posV.tp : posV.sl; }
+          else {
+            /* PlnL não chegou (raro): decide pelo preço atual na direção da posição. */
+            try{
+              const t3 = await bbJson(`${BYBIT}/v5/market/tickers?category=linear&symbol=${sym2}`);
+              const lp = parseFloat(t3.result.list[0].lastPrice);
+              whyL = (lp - posV.entry) * (posV.side === 'LONG' ? 1 : -1) >= 0 ? 'WIN' : 'LOSS';
+              priceL = whyL === 'WIN' ? posV.tp : posV.sl;
+            } catch(e){ whyL = 'PLANEJADO'; priceL = posV.entry; }
+          }
+          roboClose(posV, priceL, whyL, pnlL);
+          saveState();
+          const RV = state.robo;
+          if(RV && RV.eq <= (RV.dayStartEq || RV.eq) * (1 - CFG.roboDailyStop) && !RV.killed){
+            RV.killed = true;
+            sendAlert('🛑 ROBÔ: kill switch diário (' + (CFG.roboDailyStop * 100) + '%) atingido · equity ' + fmtV(RV.eq) + '\nNenhuma nova posição hoje. Zera automaticamente amanhã.');
+          }
+        }
       }
     }
   } catch(e){ log('demoTick: ' + e.message); }
@@ -782,8 +810,7 @@ async function roboOpen(sym, res){
   const liq = side === 'LONG' ? entry * (1 - 1 / CFG.roboLev * 0.9) : entry * (1 + 1 / CFG.roboLev * 0.9);
   const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), risk0: aiRound(riskDist), trailLvl: 0, qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), lev: CFG.roboLev, margin: Number(margin.toFixed(2)), liq: aiRound(liq), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
   R.positions.push(pos);
-  log('🤖 ROBÔ PAPER #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
-  sendAlert('🤖 ROBÔ PAPER #' + pos.id + '\n' + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp) + '\n💰 Qty ' + pos.qty + ' (≈' + fmtV(notional) + ')\n🏦 Margem ' + fmtV(margin) + ' · Liq estimada ≈ ' + fmtV(liq) + '\n🧪 Papel · risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
+  log('🟨 ROBÔ DEMO #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
   /* CONTA DEMO: se BYBIT_DEMO=1 e as chaves estão configuradas, manda a ordem
      REAL (market) na conta demo com SL/TP e alavancagem registrados na Bolsa. */
   if(CFG.bybitDemo){
@@ -794,14 +821,24 @@ async function roboOpen(sym, res){
       await demoApi('POST', '/v5/position/set-leverage', { category: 'linear', symbol: sym, buyLeverage: levS, sellLeverage: levS }).catch(e => { if(!/110043/.test(e.message)) log('⚠ alavancagem demo: ' + e.message); });
       const r = await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: sym, side: side === 'LONG' ? 'Buy' : 'Sell', orderType: 'Market', qty: String(qtyD), stopLoss: String(sl), takeProfit: String(tp), positionIdx: 0 });
       pos.demoOrderId = r.orderId;
+      pos.qtyEx = qtyD; /* qty REAL no exchange (lote arredondado) — timeout/fecho usam esta */
       log('🟨 DEMO: ordem enviada ' + sym + ' ' + side + ' qty ' + qtyD + ' (id ' + r.orderId + ')');
-      sendAlert('🟨 CONTA DEMO: ordem enviada ✅\n' + sym + ' ' + side + ' · Market · qty ' + qtyD + '\n🛑 SL ' + fmtV(sl) + ' · 🏁 TP1 ' + fmtV(tp) + ' registrados na BOLSA\nId: ' + r.orderId + '\n(positivo: a Bolsa dispara sozinha, mesmo se o Render dormir)');
       saveState();
     } catch(e){
       log('❌ DEMO falhou em ' + sym + ': ' + e.message);
       sendAlert('❌ CONTA DEMO: ordem FALHOU em ' + sym + '\nMotivo: ' + e.message + '\nA posição segue SÓ no papel. Confira chaves/permissões (Read+Trade) e fundos demo.');
     }
   }
+  /* Alerta de abertura DEPOIS do resultado da ordem (nunca anuncia "na bolsa"
+     uma posição que o exchange rejeitou): */
+  sendAlert((pos.demoOrderId ? '🟨 ROBÔ DEMO #' + pos.id + '\n' : '🧪 ROBÔ PAPER #' + pos.id + '\n')
+    + (side === 'LONG' ? '🟢' : '🔴') + ' ' + sym + ' ' + side + ' · FUTUROS ' + CFG.roboLev + 'x'
+    + (pos.demoOrderId ? ' · CONTA DEMO (ordem real, dinheiro virtual)' : '')
+    + '\n🎯 Entrada ' + fmtV(entry) + ' · Stop ' + fmtV(sl) + ' · TP1 ' + fmtV(tp)
+    + '\n💰 Qty ' + (pos.qtyEx || pos.qty) + ' (≈' + fmtV(notional) + ')'
+    + '\n🏦 Margem ' + fmtV(margin) + ' · Liq estimada ≈ ' + fmtV(liq)
+    + (pos.demoOrderId ? '\n🛡️ SL/TP registrados na BOLSA — disparam sozinhos' : '')
+    + '\n💰 risco ' + (CFG.roboRisk * 100) + '% (' + fmtV(riskUSD) + ') · equity ' + fmtV(R.eq));
 }
 async function roboTick(){
   roboEnsure();
@@ -815,6 +852,38 @@ async function roboTick(){
   } catch(e){ return; }
   const fechar = [];
   for(const p of R.positions){
+    // DEMO: a corretora é a verdade — SL/TP registrados nela disparam sozinhos.
+    // Aqui só: espelha o stop do trailing no exchange e trata timeout.
+    // Fecho local desativado (demoTick reconcilia com o PnL real da corretora).
+    if(p.demoOrderId){
+      const price = px[p.sym]; if(!price) continue;
+      const dirT = p.side === 'LONG' ? 1 : -1;
+      const caminho = Math.abs(p.tp - p.entry);
+      const prog = (price - p.entry) * dirT;
+      if(caminho > 0 && (p.trailLvl || 0) < 1 && prog >= 0.8 * caminho){
+        p.sl = aiRound(p.entry + dirT * 0.5 * caminho);
+        p.trailLvl = 1;
+        demoApi('POST', '/v5/position/set-trading-stop', { category: 'linear', symbol: p.sym, stopLoss: String(p.sl), positionIdx: 0 }).catch(e => log('⚠ demo stop: ' + e.message));
+        saveState();
+        sendAlert('🔒 DEMO ' + p.sym + ': 80% do caminho — stop do exchange subiu (' + fmtV(p.sl) + ')');
+      }
+      if(caminho > 0 && (p.trailLvl || 0) < 2 && prog >= 0.9 * caminho){
+        p.sl = aiRound(p.entry + dirT * 0.8 * caminho);
+        p.trailLvl = 2;
+        demoApi('POST', '/v5/position/set-trading-stop', { category: 'linear', symbol: p.sym, stopLoss: String(p.sl), positionIdx: 0 }).catch(e => log('⚠ demo stop: ' + e.message));
+        saveState();
+        sendAlert('🔒 DEMO ' + p.sym + ': 90% do caminho — stop do exchange travando 80% do lucro (' + fmtV(p.sl) + ')');
+      }
+      if(Date.now() - p.ts > p.maxHold){
+        try{
+          await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.sym, side: p.side === 'LONG' ? 'Sell' : 'Buy', orderType: 'Market', qty: String(p.qtyEx || p.qty), reduceOnly: true, positionIdx: 0 });
+          sendAlert('⏱ DEMO ' + p.sym + ': time stop — posição fechada no exchange');
+        } catch(e){ log('❌ DEMO timeout close falhou em ' + p.sym + ': ' + e.message); }
+        roboClose(p, p.tp, 'TIMEOUT');
+        saveState();
+      }
+      continue;
+    }
     const price = px[p.sym]; if(!price) continue;
     let hitTP = p.side === 'LONG' ? price >= p.tp : price <= p.tp;
     let hitSL = p.side === 'LONG' ? price <= p.sl : price >= p.sl;
@@ -890,10 +959,10 @@ async function roboTick(){
     saveState();
   }
 }
-function roboClose(p, price, why){
+function roboClose(p, price, why, pnlOverride){
   const R = state.robo;
   const dir = p.side === 'LONG' ? 1 : -1;
-  const pnl = (price - p.entry) * p.qty * dir;
+  const pnl = pnlOverride != null ? Number(pnlOverride) : (price - p.entry) * p.qty * dir;
   const pnlR = pnl / (p.riskUSD || 1);
   R.eq = Number((R.eq + pnl).toFixed(4));
   R.dayPnl = Number(((R.dayPnl || 0) + pnl).toFixed(4));
@@ -923,17 +992,26 @@ async function roboCmd(){
       sendAlert('⏸ ROBÔ PAPER pausado. Posições abertas seguem monitoradas até TP/SL. Envie RETOMAR para voltar.');
     } else if(t.includes('RETOMAR')){
       state.robo.paused = false; state.robo.killed = false; saveState();
-      sendAlert('▶️ ROBÔ PAPER retomado. Novos sinais serão executados em papel.');
+      sendAlert('▶️ ROBÔ retomado. Novos sinais serão executados ' + (CFG.bybitDemo ? 'na CONTA DEMO (ordens reais, dinheiro virtual)' : 'em papel') + '.');
     } else if(t.includes('FECHAR')){
       let px = null;
       try{ const r = await bbJson(`${BYBIT}/v5/market/tickers?category=linear`); px = {}; ((r.result && r.result.list) || []).forEach(x => { px[x.symbol] = parseFloat(x.lastPrice); }); } catch(e){}
-      for(const p of state.robo.positions.slice()) roboClose(p, px ? (px[p.sym] || p.entry) : p.entry, 'MANUAL');
+      for(const p of state.robo.positions.slice()){
+        // DEMO: fecha TAMBÉM no exchange (senão a posição demo ficaria aberta)
+        if(p.demoOrderId){
+          try{
+            await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.sym, side: p.side === 'LONG' ? 'Sell' : 'Buy', orderType: 'Market', qty: String(p.qtyEx || p.qty), reduceOnly: true, positionIdx: 0 });
+            sendAlert('🟨 DEMO: posição fechada no exchange (' + p.sym + ')');
+          } catch(e){ log('❌ DEMO fechar falhou em ' + p.sym + ': ' + e.message); }
+        }
+        roboClose(p, px ? (px[p.sym] || p.entry) : p.entry, 'MANUAL');
+      }
       saveState();
     } else if(t.includes('STATUS')){
       const R2 = state.robo, dia = R2.dayPnl || 0;
       const meta = roboMeta();
       const metaTxt = dia >= meta ? '✅ META BATIDA' : 'faltam ' + fmtV(Math.max(0, meta - dia)) + ' p/ meta';
-      sendAlert('🤖 ROBÔ PAPER · STATUS\nEquity: ' + fmtV(R2.eq) + '\nDia: ' + (dia >= 0 ? '+' : '') + fmtV(dia) + ' / meta +' + fmtV(meta) + ' · ' + metaTxt + '\nSemana (7d): ' + (roboSemana() >= 0 ? '+' : '') + fmtV(roboSemana()) + '\nPosições abertas: ' + R2.positions.length + '/' + CFG.roboMaxPos + (R2.paused ? '\n⏸ pausado' : '') + (R2.killed ? '\n🛑 kill switch ativo' : ''));
+      sendAlert((CFG.bybitDemo ? '🟨 ROBÔ CONTA DEMO · STATUS' : '🤖 ROBÔ PAPER · STATUS') + '\nModo: ' + (CFG.bybitDemo ? 'CONTA DEMO (ordens reais, dinheiro virtual)' : 'papel') + '\nEquity: ' + fmtV(R2.eq) + '\nDia: ' + (dia >= 0 ? '+' : '') + fmtV(dia) + ' / meta +' + fmtV(meta) + ' · ' + metaTxt + '\nSemana (7d): ' + (roboSemana() >= 0 ? '+' : '') + fmtV(roboSemana()) + '\nPosições abertas: ' + R2.positions.length + '/' + CFG.roboMaxPos + (CFG.bybitDemo ? '\nDemo abertas: ' + [...DEMO_TRACK.keys()].join(', ') : '') + (R2.paused ? '\n⏸ pausado' : '') + (R2.killed ? '\n🛑 kill switch ativo' : ''));
     }
   }
   if(ups.length) saveState();
@@ -1318,6 +1396,15 @@ if(isNode){
           const r = await demoApi('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDT' });
           const n = ((r && r.list) || []).length;
           log('🟨 Bybit DEMO conectada ✅ · chaves válidas · ' + n + ' posição(ões) aberta(s) no demo');
+          /* Restart não deve perder o rastro: se o container recriou (state.json
+             efêmero) e a posição sobreviveu no demo, repovoa o tracking — o
+             demoTick volta a detectar o fecho dela. */
+          ((r && r.list) || []).forEach(p => {
+            if(parseFloat(p.size) > 0 && !DEMO_TRACK.has(p.symbol)){
+              DEMO_TRACK.set(p.symbol, parseFloat(p.size) > 0 ? (p.side === 'Sell' ? 'SHORT' : 'LONG') : 'LONG');
+              log('🟨 DEMO: rastro repovoado após restart — ' + p.symbol);
+            }
+          });
           if(CFG.tgToken && CFG.tgChat) sendTelegram('🟨 CONTA DEMO conectada ✅\nChaves válidas (Read validado na Bybit)\nPosições demo abertas: ' + n + '\nModo: ordens REAIS em conta demo (dinheiro virtual)\nDomínio: api-demo.bybit.com\nSL/TP registrados na Bolsa — disparam sozinhos');
         } catch(e){ log('❌ Bybit demo FALHOU: ' + e.message + ' — confira BYBIT_API_KEY/SECRET e permissões (Read+Trade, sem restrição de IP)'); }
       })();
@@ -1344,8 +1431,9 @@ if(isNode){
   setInterval(() => scoreTick().catch(() => {}), 30000);
   if(CFG.robo){
     roboEnsure();
-    log('🧪 ROBÔ PAPER ativo · equity virtual ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '%/trade · máx ' + CFG.roboMaxPos + ' posições · kill diário -' + (CFG.roboDailyStop * 100) + '% · futuros ' + CFG.roboLev + 'x');
-    if(CFG.tgToken && CFG.tgChat && !process.argv.includes('--selftest')) sendTelegram('🧪 ROBÔ PAPER ativo ✅\nEquity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nFuturos Bybit · alavancagem ' + CFG.roboLev + 'x · máx ' + CFG.roboMaxPos + ' posições\nKill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
+    if(CFG.bybitDemo) log('🟨 ROBÔ CONTA DEMO ativo · ordens REAIS em api-demo.bybit.com (dinheiro virtual) · SL/TP registrados na Bolsa');
+    log((CFG.bybitDemo ? '🟨 ROBÔ CONTA DEMO' : '🧪 ROBÔ PAPER') + ' ativo · equity virtual ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '%/trade · máx ' + CFG.roboMaxPos + ' posições · kill diário -' + (CFG.roboDailyStop * 100) + '% · futuros ' + CFG.roboLev + 'x');
+    if(CFG.tgToken && CFG.tgChat && !process.argv.includes('--selftest')) sendTelegram((CFG.bybitDemo ? '🟨 ROBÔ CONTA DEMO ativo ✅\nOrdens REAIS em api-demo.bybit.com (dinheiro virtual)\nSL/TP registrados na BOLSA — disparam sozinhos, mesmo se o Render dormir\n' : '🧪 ROBÔ PAPER ativo ✅\n') + 'Equity virtual: ' + fmtV(CFG.roboEq) + ' · risco ' + (CFG.roboRisk * 100) + '% por trade\nFuturos Bybit · alavancagem ' + CFG.roboLev + 'x · máx ' + CFG.roboMaxPos + ' posições\nKill switch diário -' + (CFG.roboDailyStop * 100) + '%\nComandos: PAUSAR · RETOMAR · FECHAR TUDO · STATUS');
     setInterval(() => roboTick().catch(e => log('roboTick: ' + e.message)), 30000);
     setInterval(() => roboCmd().catch(() => {}), 20000);
     if(CFG.bybitDemo) setInterval(() => demoTick().catch(e => log('demoTick: ' + e.message)), 20000);
