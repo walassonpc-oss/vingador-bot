@@ -810,7 +810,7 @@ async function roboOpen(sym, res){
   const liq = side === 'LONG' ? entry * (1 - 1 / CFG.roboLev * 0.9) : entry * (1 + 1 / CFG.roboLev * 0.9);
   const pos = { id: ++R.trades, sym, side, entry: aiRound(entry), sl: aiRound(sl), tp: aiRound(tp), risk0: aiRound(riskDist), trailLvl: 0, qty: Number(qty.toFixed(6)), riskUSD: Number(riskUSD.toFixed(2)), lev: CFG.roboLev, margin: Number(margin.toFixed(2)), liq: aiRound(liq), ts: Date.now(), maxHold: PROFILES[CFG.profile].hold };
   R.positions.push(pos);
-  log('🟨 ROBÔ DEMO #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
+  log((CFG.bybitDemo ? '🟨 ROBÔ DEMO' : '🧪 ROBÔ PAPER') + ' #' + pos.id + ' ' + sym + ' ' + side + ' · entrada ' + fmtV(entry) + ' · SL ' + fmtV(sl) + ' · TP ' + fmtV(tp) + ' · qty ' + pos.qty + ' (≈' + fmtV(notional) + ') · ' + CFG.roboLev + 'x · margem ' + fmtV(margin));
   /* CONTA DEMO: se BYBIT_DEMO=1 e as chaves estão configuradas, manda a ordem
      REAL (market) na conta demo com SL/TP e alavancagem registrados na Bolsa. */
   if(CFG.bybitDemo){
