@@ -1233,7 +1233,7 @@ async function v12Backtest(opt){
   const btcB = v12Resample((await byKlinesDeep('BTCUSDT', baseTf, want)).filter(x => +x[6] < Date.now()), TF_MS[prof.tfs[1]] || ms * 4);
   const n = kb.length, warm = 210, nT = Math.floor(n * CFG.btTrainPct);
   // passada 1: calcs cacheados por barra (janelas 100% fechadas, sem look-ahead)
-  const ptrs = [0, 0], btPtr = 0;
+  const ptrs = [0, 0]; let btPtr = 0;
   const C = [];
   for(let i = 210; i < n; i++){
     const T = +kb[i][6];
