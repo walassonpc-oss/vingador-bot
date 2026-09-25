@@ -689,7 +689,7 @@ async function demoRebuildState(){
     if(!all.length){ log('🟨 DEMO: histórico vazio na corretora — equity virtual começa em ' + fmtV(CFG.roboEq)); return null; }
     all.sort((a, b) => Number(a.updatedTime) - Number(b.updatedTime));
     const total = all.reduce((s, x) => s + (parseFloat(x.closedPnl) || 0), 0);
-    const R = roboEnsure();
+    const R = roboEnsure() || state.robo;
     R.eq = Number((CFG.roboEq + total).toFixed(4));
     R.day = roboDay(); R.dayStartEq = R.eq; R.dayPnl = 0; R.dayWins = 0; R.dayLosses = 0;
     R.closed = all.slice(-50).map(x => {
@@ -730,10 +730,10 @@ async function demoTick(){
         const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice) || entry, sl = parseFloat(p.stopLoss) || 0;
         const risk = sl ? Math.abs(entry - sl) : 0;
         const prog = (mark - entry) * dir;
-        /* Guarda de restart: stop na ZONA DO BREAKEVEN (entrada..entrada+0.35R) = parcial
-           já aconteceu. Trailing lvl1/lvl2 (stop em 1R/1.6R) NÃO conta — enganaria a guarda
-           e bloquearia o parcial legítimo (preço saltou de 0.9R pra 1.7R num gap). */
-        const beDone = risk > 0 && sl && (dir === 1 ? (sl >= entry && sl <= entry + 0.35 * risk) : (sl <= entry && sl >= entry - 0.35 * risk));
+        /* Guarda de restart: QUALQUER stop já no lado do lucro (breakeven 0.05R,
+           trailing 1R ou 1.6R) = mecânica pós-entrada já aconteceu — não repete o
+           parcial. Cobre o caso "parcial → trailing → deploy → restart". */
+        const beDone = risk > 0 && sl && (dir === 1 ? (sl >= entry - 0.02 * risk) : (sl <= entry + 0.02 * risk));
         if(risk > 0 && prog >= risk && !beDone && !DEMO_PART.get(p.symbol)){
           const lotS = await demoQtyStep(p.symbol);
           const half = String(demoQtyRound(parseFloat(p.size) * 0.5, lotS));
