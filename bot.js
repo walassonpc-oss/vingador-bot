@@ -666,6 +666,49 @@ function demoPartRestore(){
     Object.keys(d).forEach(k => DEMO_PART.set(k, Number(d[k]) || 0));
   }catch(e){}
 }
+/* Reconstrói equity/placar do histórico REAL da corretora demo no boot.
+   O state.json do Render é efêmero (cada deploy apaga o disco), mas o
+   closed-pnl da Bybit é permanente — a memória do robô passa a viver na
+   corretora, não no container. Só roda em estado "zerado" (pós-deploy):
+   se o state.json sobreviveu, os números já estão nele (evita dupla contagem). */
+async function demoRebuildState(){
+  try{
+    const R0 = state.robo;
+    const fresh = !R0 || (!(R0.closed || []).length && Math.abs((Number(R0.eq) || CFG.roboEq) - CFG.roboEq) < 1e-9);
+    if(!fresh){ log('🟨 DEMO: state.json sobreviveu ao restart — reconstrução da corretora dispensada'); return null; }
+    let all = [], cursor = '';
+    for(let pg = 0; pg < 3; pg++){
+      const q = { category: 'linear', limit: 200 };
+      if(cursor) q.cursor = cursor;
+      const c = await demoApi('GET', '/v5/position/closed-pnl', q);
+      const items = (c && c.list) || [];
+      all = all.concat(items);
+      cursor = (c && c.nextPageCursor) || '';
+      if(!cursor || !items.length) break;
+    }
+    if(!all.length){ log('🟨 DEMO: histórico vazio na corretora — equity virtual começa em ' + fmtV(CFG.roboEq)); return null; }
+    all.sort((a, b) => Number(a.updatedTime) - Number(b.updatedTime));
+    const total = all.reduce((s, x) => s + (parseFloat(x.closedPnl) || 0), 0);
+    const R = roboEnsure();
+    R.eq = Number((CFG.roboEq + total).toFixed(4));
+    R.day = roboDay(); R.dayStartEq = R.eq; R.dayPnl = 0; R.dayWins = 0; R.dayLosses = 0;
+    R.closed = all.slice(-50).map(x => {
+      const pnl = parseFloat(x.closedPnl) || 0;
+      return { id: String(x.id || x.updatedTime || ''), sym: x.symbol,
+        side: x.side === 'Buy' ? 'SHORT' : 'LONG',  // side do campo = ordem que FECHOU (lado oposto da posição)
+        entry: Number(x.avgEntryPrice), exit: Number(x.avgExitPrice),
+        why: pnl >= 0 ? 'WIN' : 'LOSS',
+        pnl: Number(pnl.toFixed(4)),
+        pnlR: Number((pnl / (CFG.roboEq * CFG.roboRisk)).toFixed(2)),
+        ts: Number(x.updatedTime) || Date.now() };
+    });
+    R.trades = all.length;
+    saveState();
+    const wins = R.closed.filter(c => c.why === 'WIN').length, losses = R.closed.length - wins;
+    log('🟨 DEMO: estado reconstruído da corretora — ' + all.length + ' trade(s) · PnL acumulado ' + (total >= 0 ? '+' : '') + total.toFixed(4) + ' · equity ' + fmtV(R.eq) + ' (' + wins + 'W/' + losses + 'L)');
+    return { trades: all.length, total: Number(total.toFixed(4)), eq: R.eq, wins, losses };
+  } catch(e){ log('⚠ DEMO: reconstrução do estado falhou (' + e.message + ') — seguindo com state.json'); return null; }
+}
 async function demoTick(){
   if(!CFG.bybitDemo) return;
   try{
@@ -919,13 +962,16 @@ async function roboTick(){
         sendAlert('🔒 DEMO ' + p.sym + ': 90% do caminho — stop do exchange travando 80% do lucro (' + fmtV(p.sl) + ')');
       }
       if(Date.now() - p.ts > p.maxHold){
-        try{
-          await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.sym, side: p.side === 'LONG' ? 'Sell' : 'Buy', orderType: 'Market', qty: String(p.qtyEx || p.qty), reduceOnly: true, positionIdx: 0 });
-          sendAlert('⏱ DEMO ' + p.sym + ': time stop — posição fechada no exchange');
-        } catch(e){ log('❌ DEMO timeout close falhou em ' + p.sym + ': ' + e.message); }
-        /* Preço REAL do mercado (não o TP): o time-stop sai a market na corretora. */
-        roboClose(p, px[p.sym] || p.tp, 'TIMEOUT');
-        saveState();
+        /* Envia o fecho a market UMA vez só; NÃO credita equity aqui — quem
+           reconcilia com o PnL REAL da corretora (e credita o delta certo,
+           sem dupla contagem do parcial) é o demoTick. */
+        if(!p.timeoutSent){
+          p.timeoutSent = true; saveState();
+          try{
+            await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.sym, side: p.side === 'LONG' ? 'Sell' : 'Buy', orderType: 'Market', qty: String(p.qtyEx || p.qty), reduceOnly: true, positionIdx: 0 });
+            sendAlert('⏱ DEMO ' + p.sym + ': time stop — posição fechada no exchange');
+          } catch(e){ log('❌ DEMO timeout close falhou em ' + p.sym + ': ' + e.message); }
+        }
       }
       continue;
     }
@@ -1027,8 +1073,9 @@ function roboClose(p, price, why, pnlOverride, eqDelta){
   R.closed.push({ id: p.id, sym: p.sym, side: p.side, entry: p.entry, exit: aiRound(price), why, pnl: Number(pnl.toFixed(4)), pnlR: Number(pnlR.toFixed(2)), ts: Date.now() });
   if(R.closed.length > 200) R.closed = R.closed.slice(-200);
   const emoji = why === 'WIN' ? '✅' : why === 'LOSS' ? '❌' : '⏱';
-  log('🤖 ROBÔ ' + emoji + ' #' + p.id + ' ' + p.sym + ' ' + why + ' · PnL ' + (pnl >= 0 ? '+' : '') + fmtV(pnl) + ' (' + (pnlR >= 0 ? '+' : '') + pnlR.toFixed(2) + 'R) · equity ' + fmtV(R.eq));
-  sendAlert(emoji + ' ROBÔ PAPER #' + p.id + ' · ' + p.sym + ' ' + p.side + ' · ' + why + '\nSaiu em ' + fmtV(price) + '\nPnL ' + (pnl >= 0 ? '+' : '') + fmtV(pnl) + ' (' + (pnlR >= 0 ? '+' : '') + pnlR.toFixed(2) + 'R)\n💰 Equity: ' + fmtV(R.eq) + '\nDia: ' + ((R.dayPnl || 0) >= 0 ? '+' : '') + fmtV(R.dayPnl || 0));
+  const robôTag = CFG.bybitDemo ? '🟨 ROBÔ DEMO' : '🧪 ROBÔ PAPER';
+  log(robôTag + ' ' + emoji + ' #' + p.id + ' ' + p.sym + ' ' + why + ' · PnL ' + (pnl >= 0 ? '+' : '') + fmtV(pnl) + ' (' + (pnlR >= 0 ? '+' : '') + pnlR.toFixed(2) + 'R) · equity ' + fmtV(R.eq));
+  sendAlert(emoji + ' ' + robôTag + ' #' + p.id + ' · ' + p.sym + ' ' + p.side + ' · ' + why + '\nSaiu em ' + fmtV(price) + '\nPnL ' + (pnl >= 0 ? '+' : '') + fmtV(pnl) + ' (' + (pnlR >= 0 ? '+' : '') + pnlR.toFixed(2) + 'R)\n💰 Equity: ' + fmtV(R.eq) + '\nDia: ' + ((R.dayPnl || 0) >= 0 ? '+' : '') + fmtV(R.dayPnl || 0));
 }
 async function roboCmd(){
   if(!CFG.tgToken || !CFG.tgChat) return;
@@ -1044,7 +1091,7 @@ async function roboCmd(){
     const t = String(msg.text || '').toUpperCase().trim();
     if(t.includes('PAUSAR')){
       state.robo.paused = true; saveState();
-      sendAlert('⏸ ROBÔ PAPER pausado. Posições abertas seguem monitoradas até TP/SL. Envie RETOMAR para voltar.');
+      sendAlert('⏸ ' + (CFG.bybitDemo ? 'ROBÔ DEMO' : 'ROBÔ PAPER') + ' pausado. Posições abertas seguem monitoradas até TP/SL. Envie RETOMAR para voltar.');
     } else if(t.includes('RETOMAR')){
       state.robo.paused = false; state.robo.killed = false; saveState();
       sendAlert('▶️ ROBÔ retomado. Novos sinais serão executados ' + (CFG.bybitDemo ? 'na CONTA DEMO (ordens reais, dinheiro virtual)' : 'em papel') + '.');
@@ -1058,8 +1105,15 @@ async function roboCmd(){
             await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.sym, side: p.side === 'LONG' ? 'Sell' : 'Buy', orderType: 'Market', qty: String(p.qtyEx || p.qty), reduceOnly: true, positionIdx: 0 });
             sendAlert('🟨 DEMO: posição fechada no exchange (' + p.sym + ')');
           } catch(e){ log('❌ DEMO fechar falhou em ' + p.sym + ': ' + e.message); }
+          /* eqDelta = total estimado - parcial já creditado (evita dupla contagem). */
+          const dirF = p.side === 'LONG' ? 1 : -1;
+          const priceF = px ? (px[p.sym] || p.entry) : p.entry;
+          const partF = typeof DEMO_PART.get(p.sym) === 'number' ? DEMO_PART.get(p.sym) : 0;
+          const totalF = Number(((priceF - p.entry) * p.qty * dirF).toFixed(4));
+          roboClose(p, priceF, 'MANUAL', totalF, Number((totalF - partF).toFixed(4)));
+        } else {
+          roboClose(p, px ? (px[p.sym] || p.entry) : p.entry, 'MANUAL');
         }
-        roboClose(p, px ? (px[p.sym] || p.entry) : p.entry, 'MANUAL');
       }
       saveState();
     } else if(t.includes('STATUS')){
@@ -1461,7 +1515,11 @@ if(isNode){
               log('🟨 DEMO: rastro repovoado após restart — ' + p.symbol);
             }
           });
-          if(CFG.tgToken && CFG.tgChat) sendTelegram('🟨 CONTA DEMO conectada ✅\nChaves válidas (Read validado na Bybit)\nPosições demo abertas: ' + n + '\nModo: ordens REAIS em conta demo (dinheiro virtual)\nDomínio: api-demo.bybit.com\nSL/TP registrados na Bolsa — disparam sozinhos');
+          /* Reconstrói equity/placar do histórico REAL da corretora (closed-pnl
+             é permanente; o state.json do Render morre a cada deploy). */
+          const rb = await demoRebuildState();
+          const rbTxt = rb ? ('\n📊 Estado reconstruído da corretora: ' + rb.trades + ' trades · PnL ' + (rb.total >= 0 ? '+' : '') + rb.total + ' · equity ' + fmtV(rb.eq) + ' (' + rb.wins + 'W/' + rb.losses + 'L)') : '';
+          if(CFG.tgToken && CFG.tgChat) sendTelegram('🟨 CONTA DEMO conectada ✅\nChaves válidas (Read validado na Bybit)\nPosições demo abertas: ' + n + '\nModo: ordens REAIS em conta demo (dinheiro virtual)\nDomínio: api-demo.bybit.com\nSL/TP registrados na Bolsa — disparam sozinhos' + rbTxt);
         } catch(e){ log('❌ Bybit demo FALHOU: ' + e.message + ' — confira BYBIT_API_KEY/SECRET e permissões (Read+Trade, sem restrição de IP)'); }
       })();
     } else log('⚠ BYBIT_DEMO=1 mas chaves vazias — modo demo inativo (configure BYBIT_API_KEY/SECRET no Render)');
