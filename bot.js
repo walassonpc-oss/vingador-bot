@@ -122,10 +122,10 @@ const CFG = {
   robo: String(ENV.ROBO ?? '1') !== '0',
   roboEq: Number(ENV.ROBO_EQ) || 100,                                   // equity virtual inicial ($100 = capital real)
   roboRisk: Math.min(0.02, Number(ENV.ROBO_RISK) || 0.01),              // 1% por trade (teto 2%)
-  roboMaxPos: Math.max(1, Math.min(3, Number(ENV.ROBO_MAXPOS) || 2)),   // máx 2 posições (teto 3)
+  roboMaxPos: Math.max(1, Math.min(3, Number(ENV.ROBO_MAXPOS) || 3)),   // máx 3 posições
   roboDailyStop: Math.min(0.1, Number(ENV.ROBO_DAILY_STOP) || 0.03),    // kill switch: -3% no dia
   roboLev: Math.max(1, Math.min(20, Number(ENV.ROBO_LEV) || 5)),        // alavancagem 5x (teto 20x)
-  roboMetaPct: Math.min(10, Number(ENV.ROBO_META_PCT) || 1.5),          // meta diária: 1.5% da equity (escala com a conta)
+  roboMetaPct: Math.min(10, Number(ENV.ROBO_META_PCT) || 2.5),          // meta diária: 2.5% da equity (escala com a conta)
   // V12 · Backtest + Walk-Forward (blueprint do auditor V12):
   btDays: Math.min(365, Math.max(7, Number(ENV.BACKTEST_DAYS) || 90)),
   btFeeBps: Math.min(50, Math.max(0, Number(ENV.BACKTEST_FEE_BPS) || 5.5)),
@@ -579,7 +579,7 @@ if(isNode){ try { fsMod = require('fs'); } catch(e){} try { cryptoMod = require(
 function saveState(){
   if(!fsMod) return;
   try{
-    fsMod.writeFileSync(CFG.stateFile, JSON.stringify({ signals: state.signals, alertTs: state.alertTs, cycles: state.cycles, alertsSent: state.alertsSent, lastScan: state.lastScan, startedAt: state.startedAt, oiHist: state.oiHist || {}, lossTs: state.lossTs || {}, robo: state.robo }));
+    fsMod.writeFileSync(CFG.stateFile, JSON.stringify({ signals: state.signals, alertTs: state.alertTs, cycles: state.cycles, alertsSent: state.alertsSent, lastScan: state.lastScan, startedAt: state.startedAt, oiHist: state.oiHist || {}, lossTs: state.lossTs || {}, robo: state.robo, demoPart: state.demoPart || {} }));
   } catch(e){}
 }
 function loadState(){
@@ -596,6 +596,7 @@ function loadState(){
       state.oiHist = (d.oiHist && typeof d.oiHist === 'object') ? d.oiHist : {};
       state.lossTs = (d.lossTs && typeof d.lossTs === 'object') ? d.lossTs : {};
       state.robo = (d.robo && typeof d.robo === 'object') ? d.robo : null;
+      state.demoPart = (d.demoPart && typeof d.demoPart === 'object') ? d.demoPart : {};
     }
   } catch(e){}
 }
@@ -656,6 +657,15 @@ function demoQtyRound(q, lot){
 }
 const DEMO_TRACK = new Map();
 const DEMO_PART = new Map();
+function demoPartPersist(){
+  try{ state.demoPart = Object.fromEntries(DEMO_PART); }catch(e){}
+}
+function demoPartRestore(){
+  try{
+    const d = state.demoPart || {};
+    Object.keys(d).forEach(k => DEMO_PART.set(k, Number(d[k]) || 0));
+  }catch(e){}
+}
 async function demoTick(){
   if(!CFG.bybitDemo) return;
   try{
@@ -677,43 +687,76 @@ async function demoTick(){
         const entry = parseFloat(p.avgPrice), mark = parseFloat(p.markPrice) || entry, sl = parseFloat(p.stopLoss) || 0;
         const risk = sl ? Math.abs(entry - sl) : 0;
         const prog = (mark - entry) * dir;
-        if(risk > 0 && prog >= risk){
+        /* Guarda de restart: stop na ZONA DO BREAKEVEN (entrada..entrada+0.35R) = parcial
+           já aconteceu. Trailing lvl1/lvl2 (stop em 1R/1.6R) NÃO conta — enganaria a guarda
+           e bloquearia o parcial legítimo (preço saltou de 0.9R pra 1.7R num gap). */
+        const beDone = risk > 0 && sl && (dir === 1 ? (sl >= entry && sl <= entry + 0.35 * risk) : (sl <= entry && sl >= entry - 0.35 * risk));
+        if(risk > 0 && prog >= risk && !beDone && !DEMO_PART.get(p.symbol)){
           const lotS = await demoQtyStep(p.symbol);
           const half = String(demoQtyRound(parseFloat(p.size) * 0.5, lotS));
           try{
             await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.symbol, side: p.side === 'Buy' ? 'Sell' : 'Buy', orderType: 'Market', qty: half, reduceOnly: true, positionIdx: 0 });
             await demoApi('POST', '/v5/position/set-trading-stop', { category: 'linear', symbol: p.symbol, stopLoss: String(aiRound(entry + dir * 0.05 * risk)), positionIdx: 0 }).catch(() => {});
-            DEMO_PART.set(p.symbol, true);
-            log('🟨 DEMO TP1 parcial: ' + p.symbol + ' 50% fechado em +1R, stop no breakeven');
-            sendAlert('🎯 DEMO ' + p.symbol + ': TP1 PARCIAL — 50% fechado em +1R\n🛑 Stop no breakeven (a BOLSA dispara sozinha). Resto corre até TP1/TP2.');
+            /* PnL REAL do parcial: a corretora registra em closed-pnl — credita na equity NA HORA. */
+            let partPnl = null;
+            for(let t=0; t<3 && partPnl == null; t++){
+              try{
+                const c = await demoApi('GET', '/v5/position/closed-pnl', { category: 'linear', symbol: p.symbol, limit: 1 });
+                const item = (c && c.list && c.list[0]) || null;
+                if(item) partPnl = parseFloat(item.closedPnl) || 0;
+              } catch(e){}
+              if(partPnl == null) await sleep(1500);
+            }
+            DEMO_PART.set(p.symbol, partPnl || 0);
+            demoPartPersist();
+            const R = state.robo;
+            if(R && partPnl != null){
+              R.eq = Number((R.eq + partPnl).toFixed(4));
+              R.dayPnl = Number(((R.dayPnl || 0) + partPnl).toFixed(4));
+              saveState();
+            }
+            log('🟨 DEMO TP1 parcial: ' + p.symbol + ' 50% fechado em +1R' + (partPnl != null ? ' · PnL ' + (partPnl >= 0 ? '+' : '') + partPnl.toFixed(4) : '') + ', stop no breakeven');
+            sendAlert('🎯 DEMO ' + p.symbol + ': TP1 PARCIAL — 50% fechado em +1R' + (partPnl != null ? '\n📊 PnL realizado: ' + (partPnl >= 0 ? '+' : '') + partPnl.toFixed(4) + ' USDT (já creditado na equity)' : '') + '\n🛑 Stop no breakeven (a BOLSA dispara sozinha). Resto corre até TP1/TP2.');
           } catch(e){ log('❌ DEMO parcial falhou em ' + p.symbol + ': ' + e.message); }
         }
       }
     }
     for(const [sym2, side2] of [...DEMO_TRACK]){
       if(!open.some(p => p.symbol === sym2)){
+        const partPnl = DEMO_PART.get(sym2);
         DEMO_TRACK.delete(sym2);
         DEMO_PART.delete(sym2);
+        const posV = (state.robo && (state.robo.positions || []).find(x => x.sym === sym2 && x.demoOrderId)) || null;
         let rp = null;
-        /* closed-pnl pode demorar a registar o último fechamento; tenta 3x
-           antes de desistir (senão vitória corria risco de virar "loss" no placar). */
-        for(let t=0; t<3; t++){
+        /* PnL TOTAL: soma TODOS os fills fechados desde a abertura da posição
+           (TP1 parcial + final), com startTime na abertura — cobre também parciais
+           que aconteceram antes de um restart/deploy. */
+        for(let t=0; t<3 && rp == null; t++){
           try{
-            const c = await demoApi('GET', '/v5/position/closed-pnl', { category: 'linear', symbol: sym2, limit: 1 });
-            const item = (c && c.list && c.list[0]) || null;
-            if(item){ rp = parseFloat(item.closedPnl) || 0; break; }
+            const q = { category: 'linear', symbol: sym2 };
+            if(posV && posV.ts){ q.limit = 20; q.startTime = String(Math.max(0, posV.ts - 60000)); }
+            else { q.limit = 1; }
+            const c = await demoApi('GET', '/v5/position/closed-pnl', q);
+            const items = (c && c.list) || [];
+            if(items.length){
+              rp = items.reduce((s, it) => s + (parseFloat(it.closedPnl) || 0), 0);
+              break;
+            }
           } catch(e){}
           await sleep(1500);
         }
-        log('🟨 DEMO posição fechada: ' + sym2 + (rp != null ? ' · PnL ' + rp.toFixed(4) : ''));
-        sendAlert('🟨 DEMO: posição FECHADA na corretora\n' + sym2 + ' ' + side2 + (rp != null ? '\n📊 PnL realizado: ' + (rp >= 0 ? '+' : '') + rp.toFixed(4) + ' USDT' : '') + '\n🏆 Placar do bot');
+        /* rp = PnL TOTAL (parcial + final). O parcial já foi creditado na equity na
+           hora (DEMO_PART) — nesses casos o delta final é rp - partPnl, senão é rp. */
+        const total = rp != null ? rp : (typeof partPnl === 'number' ? partPnl : 0);
+        const eqDelta = rp != null ? (typeof partPnl === 'number' ? rp - partPnl : rp) : (typeof partPnl === 'number' ? 0 : null);
+        log('🟨 DEMO posição fechada: ' + sym2 + ' · PnL TOTAL ' + total.toFixed(4) + (typeof partPnl === 'number' ? ' (parcial ' + partPnl.toFixed(4) + ' creditado na hora)' : ''));
+        sendAlert('🟨 DEMO: posição FECHADA na corretora\n' + sym2 + ' ' + side2 + '\n📊 PnL TOTAL realizado: ' + (total >= 0 ? '+' : '') + total.toFixed(4) + ' USDT\n🏆 Placar do bot');
         // Reconcilia o papel com o número REAL da corretora (fonte da verdade):
-        const posV = (state.robo && (state.robo.positions || []).find(x => x.sym === sym2 && x.demoOrderId)) || null;
         if(posV){
           let pnlL, whyL, priceL;
-          if(rp != null){ pnlL = rp; whyL = rp >= 0 ? 'WIN' : 'LOSS'; priceL = whyL === 'WIN' ? posV.tp : posV.sl; }
+          if(rp != null){ pnlL = total; whyL = total >= 0 ? 'WIN' : 'LOSS'; priceL = whyL === 'WIN' ? posV.tp : posV.sl; }
           else {
-            /* PlnL não chegou (raro): decide pelo preço atual na direção da posição. */
+            /* PnL não chegou (raro): decide pelo preço atual na direção da posição. */
             try{
               const t3 = await bbJson(`${BYBIT}/v5/market/tickers?category=linear&symbol=${sym2}`);
               const lp = parseFloat(t3.result.list[0].lastPrice);
@@ -721,7 +764,8 @@ async function demoTick(){
               priceL = whyL === 'WIN' ? posV.tp : posV.sl;
             } catch(e){ whyL = 'PLANEJADO'; priceL = posV.entry; }
           }
-          roboClose(posV, priceL, whyL, pnlL);
+          roboClose(posV, priceL, whyL, pnlL, eqDelta);
+          demoPartPersist();
           saveState();
           const RV = state.robo;
           if(RV && RV.eq <= (RV.dayStartEq || RV.eq) * (1 - CFG.roboDailyStop) && !RV.killed){
@@ -739,7 +783,7 @@ async function demoTick(){
    Nenhuma ordem real é enviada nesta fase — a fase de dinheiro real só existe
    depois desta provar o placar tick a tick. Regras fixas no código:
    - risco 1% da equity virtual por trade (ROBO_RISK, teto 2%)
-   - máx 2 posições simultâneas (ROBO_MAXPOS, teto 3)
+   - máx 3 posições simultâneas (ROBO_MAXPOS, teto 3)
    - kill switch: -3% no dia pausa novas entradas e avisa no Telegram
    - comandos no Telegram: PAUSAR · RETOMAR · FECHAR TUDO · STATUS */
 function roboDay(){ return new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }); }
@@ -879,7 +923,8 @@ async function roboTick(){
           await demoApi('POST', '/v5/order/create', { category: 'linear', symbol: p.sym, side: p.side === 'LONG' ? 'Sell' : 'Buy', orderType: 'Market', qty: String(p.qtyEx || p.qty), reduceOnly: true, positionIdx: 0 });
           sendAlert('⏱ DEMO ' + p.sym + ': time stop — posição fechada no exchange');
         } catch(e){ log('❌ DEMO timeout close falhou em ' + p.sym + ': ' + e.message); }
-        roboClose(p, p.tp, 'TIMEOUT');
+        /* Preço REAL do mercado (não o TP): o time-stop sai a market na corretora. */
+        roboClose(p, px[p.sym] || p.tp, 'TIMEOUT');
         saveState();
       }
       continue;
@@ -959,16 +1004,26 @@ async function roboTick(){
     saveState();
   }
 }
-function roboClose(p, price, why, pnlOverride){
+function roboClose(p, price, why, pnlOverride, eqDelta){
   const R = state.robo;
   const dir = p.side === 'LONG' ? 1 : -1;
   const pnl = pnlOverride != null ? Number(pnlOverride) : (price - p.entry) * p.qty * dir;
+  /* eqDelta: quanto efetivamente entra na equity (o parcial do TP1 já foi creditado na hora). */
+  const eqInc = eqDelta != null ? Number(eqDelta) : pnl;
   const pnlR = pnl / (p.riskUSD || 1);
-  R.eq = Number((R.eq + pnl).toFixed(4));
-  R.dayPnl = Number(((R.dayPnl || 0) + pnl).toFixed(4));
+  R.eq = Number((R.eq + eqInc).toFixed(4));
+  R.dayPnl = Number(((R.dayPnl || 0) + eqInc).toFixed(4));
   if(why === 'WIN') R.dayWins = (R.dayWins || 0) + 1;
   if(why === 'LOSS') R.dayLosses = (R.dayLosses || 0) + 1;
   R.positions = R.positions.filter(x => x.id !== p.id);
+  /* Sincroniza o placar de sinais com o resultado REAL da corretora/robô (fonte da verdade) —
+     mata o "loss fantasma" onde o rastreador independente marcava ❌ depois de o robô ter fechado ✅. */
+  const sig = (state.signals || []).find(s => s.state === 'open' && s.sym === p.sym && s.side === p.side);
+  if(sig){
+    sig.state = why === 'WIN' ? 'win' : why === 'LOSS' ? 'loss' : 'timeout';
+    sig.exit = aiRound(price); sig.closedTs = Date.now();
+    if(why === 'LOSS') (state.lossTs = state.lossTs || {})[p.sym + ':' + p.side] = Date.now();
+  }
   R.closed.push({ id: p.id, sym: p.sym, side: p.side, entry: p.entry, exit: aiRound(price), why, pnl: Number(pnl.toFixed(4)), pnlR: Number(pnlR.toFixed(2)), ts: Date.now() });
   if(R.closed.length > 200) R.closed = R.closed.slice(-200);
   const emoji = why === 'WIN' ? '✅' : why === 'LOSS' ? '❌' : '⏱';
@@ -1374,6 +1429,7 @@ function startServer(){
 /* ---------------- boot ---------------- */
 if(isNode){
   loadState();
+  demoPartRestore();
   if(process.argv.includes('--selftest')){
     runSelfTest().then(r => { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); }).catch(e => { console.error('selfTest falhou: ' + e.message); process.exit(1); });
   }
